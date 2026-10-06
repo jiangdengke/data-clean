@@ -59,6 +59,7 @@ function formatBytes(byteCount: number): string {
 function LoginScreen({ onLogin }: { onLogin: () => void }): React.JSX.Element {
   const [password, setPassword] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+
   async function submitLogin(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     try {
@@ -71,30 +72,47 @@ function LoginScreen({ onLogin }: { onLogin: () => void }): React.JSX.Element {
       setErrorMessage(error instanceof Error ? error.message : "Login failed");
     }
   }
+
   return (
     <main className="auth-shell">
-      <section className="card auth-card">
-        <p className="eyebrow">Read-only R2 operations</p>
-        <h1>R2 Model Scanner</h1>
-        <p>Sign in with the configured administrator password.</p>
-        <form onSubmit={submitLogin}>
-          <label htmlFor="password">Administrator password</label>
-          <input
-            id="password"
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-            required
-          />
+      <section className="auth-card">
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">
+            R2
+          </span>
+          <span className="brand-name">Model Scanner</span>
+        </div>
+        <div className="auth-copy">
+          <p className="eyebrow">Private workspace</p>
+          <h1>See your R2 data clearly.</h1>
+          <p>Scan a source bucket, identify its models, and keep every result close at hand.</p>
+        </div>
+        <form className="auth-form" onSubmit={submitLogin}>
+          <label className="form-field" htmlFor="password">
+            <span>Administrator password</span>
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete="current-password"
+              required
+            />
+          </label>
           {errorMessage && (
-            <p className="error-message" role="alert">
+            <p className="feedback feedback-error" role="alert">
               {errorMessage}
             </p>
           )}
-          <button type="submit">Sign in</button>
+          <button className="primary-button" type="submit">
+            Continue
+          </button>
         </form>
+        <p className="auth-footnote">
+          <span className="status-dot" aria-hidden="true" /> Read-only access. No R2 writes are performed.
+        </p>
       </section>
+      <p className="auth-footer">R2 Model Scanner</p>
     </main>
   );
 }
@@ -102,48 +120,57 @@ function LoginScreen({ onLogin }: { onLogin: () => void }): React.JSX.Element {
 function ReportView({ report }: { report: ScanReport }): React.JSX.Element {
   return (
     <section className="card report-card">
-      <h2>Scan report</h2>
+      <div className="card-header">
+        <div>
+          <p className="section-kicker">Latest result</p>
+          <h2>Scan report</h2>
+        </div>
+        <span className="status-pill is-ready">Complete</span>
+      </div>
       <div className="summary-grid">
-        <div>
-          <span>Source objects</span>
-          <strong>{report.object_count}</strong>
+        <div className="stat-card">
+          <span className="stat-label">Source objects</span>
+          <strong className="stat-value">{report.object_count}</strong>
         </div>
-        <div>
-          <span>Total bytes</span>
-          <strong>{formatBytes(report.total_bytes)}</strong>
+        <div className="stat-card">
+          <span className="stat-label">Total bytes</span>
+          <strong className="stat-value">{formatBytes(report.total_bytes)}</strong>
         </div>
-        <div>
-          <span>Models found</span>
-          <strong>{Object.keys(report.models).length}</strong>
+        <div className="stat-card">
+          <span className="stat-label">Models found</span>
+          <strong className="stat-value">{Object.keys(report.models).length}</strong>
         </div>
-        <div>
-          <span>Failures</span>
-          <strong>
+        <div className="stat-card">
+          <span className="stat-label">Failures</span>
+          <strong className="stat-value">
             {report.failed_objects.length + report.timed_out_objects.length}
           </strong>
         </div>
       </div>
-      <h3>Models</h3>
-      {Object.entries(report.models).map(([modelName, modelReport]) => (
-        <details key={modelName}>
-          <summary>
-            {modelName}: {modelReport.object_count} objects,{" "}
-            {formatBytes(modelReport.total_bytes)}
-          </summary>
-          <ul>
-            {modelReport.objects.map((sourceObject) => (
-              <li key={sourceObject.key}>
-                <code>{sourceObject.key}</code> (
-                {formatBytes(sourceObject.size)})
-              </li>
-            ))}
-          </ul>
-        </details>
-      ))}
-      <p>
+      <h3 className="section-title">Detected models</h3>
+      <div className="model-list">
+        {Object.entries(report.models).map(([modelName, modelReport]) => (
+          <details className="model-detail" key={modelName}>
+            <summary>
+              <span className="model-name">{modelName}</span>
+              <span className="model-meta">
+                {modelReport.object_count} objects / {formatBytes(modelReport.total_bytes)}
+              </span>
+            </summary>
+            <ul>
+              {modelReport.objects.map((sourceObject) => (
+                <li key={sourceObject.key}>
+                  <code>{sourceObject.key}</code>
+                  <span>{formatBytes(sourceObject.size)}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        ))}
+      </div>
+      <p className="report-footnote">
         Unmatched archives: {report.unmatched_objects.length}; non-archives:{" "}
-        {report.non_archive_objects.length}; failed:{" "}
-        {report.failed_objects.length}; timed out:{" "}
+        {report.non_archive_objects.length}; failed: {report.failed_objects.length}; timed out:{" "}
         {report.timed_out_objects.length}.
       </p>
     </section>
@@ -178,6 +205,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
         ),
       );
   }, []);
+
   useEffect(() => {
     void callApi<JobStatus | null>("/api/scans/latest")
       .then((latestJob) => {
@@ -189,9 +217,11 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
         ),
       );
   }, []);
+
   useEffect(() => {
-    if (!jobStatus || !["queued", "running"].includes(jobStatus.status))
+    if (!jobStatus || !["queued", "running"].includes(jobStatus.status)) {
       return undefined;
+    }
     const timer = window.setInterval(() => {
       void callApi<JobStatus>(`/api/scans/${jobStatus.job_id}`)
         .then(setJobStatus)
@@ -203,6 +233,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
     }, 1500);
     return () => window.clearInterval(timer);
   }, [jobStatus]);
+
   useEffect(() => {
     if (!jobStatus?.report_available) return;
     void callApi<ScanReport>(`/api/scans/${jobStatus.job_id}/report`)
@@ -214,9 +245,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
       );
   }, [jobStatus?.job_id, jobStatus?.report_available]);
 
-  async function saveConnection(
-    event: FormEvent<HTMLFormElement>,
-  ): Promise<void> {
+  async function saveConnection(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     try {
       const savedConnection = await callApi<ConnectionView>("/api/connection", {
@@ -238,6 +267,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
       );
     }
   }
+
   async function testConnection(): Promise<void> {
     try {
       const result = await callApi<{ reason: string }>("/api/connection/test", {
@@ -250,6 +280,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
       );
     }
   }
+
   async function startScan(): Promise<void> {
     try {
       const startedJob = await callApi<{ job_id: string; status: string }>(
@@ -271,10 +302,12 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
       );
     }
   }
+
   async function logout(): Promise<void> {
     await callApi("/api/logout", { method: "POST" });
     onLogout();
   }
+
   const isActive =
     jobStatus !== null && ["queued", "running"].includes(jobStatus.status);
   const progress =
@@ -283,70 +316,119 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
           (jobStatus.progress.processed / jobStatus.progress.total) * 100,
         )
       : 0;
+
   return (
     <main className="page-shell">
       <header className="page-header">
-        <div>
-          <p className="eyebrow">Authenticated workspace</p>
-          <h1>R2 Model Scanner</h1>
+        <div className="brand-and-title">
+          <div className="brand-lockup">
+            <span className="brand-mark" aria-hidden="true">
+              R2
+            </span>
+            <span className="brand-name">Model Scanner</span>
+          </div>
+          <div className="title-divider" aria-hidden="true" />
+          <div>
+            <p className="eyebrow">Authenticated workspace</p>
+            <h1>Model Scanner</h1>
+          </div>
         </div>
-        <button
-          className="secondary-button"
-          type="button"
-          onClick={() => void logout()}
-        >
-          Sign out
-        </button>
+        <div className="header-actions">
+          <span className="status-pill is-active">
+            <span className="status-dot" aria-hidden="true" /> Session active
+          </span>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void logout()}
+          >
+            Sign out
+          </button>
+        </div>
       </header>
-      <section className="notice">
-        <strong>Read-only slice:</strong> sync, upload, copy, overwrite, and
-        delete operations are not enabled.
+
+      <section className="page-intro">
+        <p className="section-kicker">Source intelligence</p>
+        <h2>A clear view of your source bucket.</h2>
+        <p>Connect once, scan deterministically, and review every model path without moving any data.</p>
       </section>
+
+      <section className="notice" role="status">
+        <span className="notice-mark" aria-hidden="true">
+          i
+        </span>
+        <div>
+          <strong>Read-only mode</strong>
+          <p>Sync, upload, copy, overwrite, and delete operations are not enabled.</p>
+        </div>
+      </section>
+
       {errorMessage && (
-        <p className="error-message" role="alert">
+        <p className="feedback feedback-error page-feedback" role="alert">
           {errorMessage}
         </p>
       )}
+
       <div className="dashboard-grid">
-        <section className="card">
-          <h2>Source connection</h2>
-          <p className="muted">
+        <section className="card workflow-card">
+          <div className="card-header">
+            <div>
+              <p className="section-kicker">Step 01</p>
+              <h2>Source connection</h2>
+            </div>
+            <span className={`status-pill ${connection.configured ? "is-ready" : "is-muted"}`}>
+              {connection.configured ? "Ready" : "Not set"}
+            </span>
+          </div>
+          <p className="card-description">
             Credentials are never returned to the browser or persisted.
           </p>
-          <form onSubmit={(event) => void saveConnection(event)}>
-            <label htmlFor="endpoint">R2 endpoint</label>
-            <input
-              id="endpoint"
-              value={endpoint}
-              onChange={(event) => setEndpoint(event.target.value)}
-              required
-            />
-            <label htmlFor="access-key-id">Access key ID</label>
-            <input
-              id="access-key-id"
-              value={accessKeyId}
-              onChange={(event) => setAccessKeyId(event.target.value)}
-              required
-              autoComplete="off"
-            />
-            <label htmlFor="secret-access-key">Secret access key</label>
-            <input
-              id="secret-access-key"
-              type="password"
-              value={secretAccessKey}
-              onChange={(event) => setSecretAccessKey(event.target.value)}
-              required
-              autoComplete="new-password"
-            />
-            <label htmlFor="source-bucket">Source bucket name</label>
-            <input
-              id="source-bucket"
-              value={sourceBucket}
-              onChange={(event) => setSourceBucket(event.target.value)}
-              required
-            />
+          <form className="connection-form" onSubmit={(event) => void saveConnection(event)}>
+            <div className="field-grid">
+              <label className="form-field" htmlFor="endpoint">
+                <span>R2 endpoint</span>
+                <input
+                  id="endpoint"
+                  value={endpoint}
+                  onChange={(event) => setEndpoint(event.target.value)}
+                  required
+                />
+              </label>
+              <label className="form-field" htmlFor="access-key-id">
+                <span>Access key ID</span>
+                <input
+                  id="access-key-id"
+                  value={accessKeyId}
+                  onChange={(event) => setAccessKeyId(event.target.value)}
+                  required
+                  autoComplete="off"
+                />
+              </label>
+              <label className="form-field" htmlFor="secret-access-key">
+                <span>Secret access key</span>
+                <input
+                  id="secret-access-key"
+                  type="password"
+                  value={secretAccessKey}
+                  onChange={(event) => setSecretAccessKey(event.target.value)}
+                  required
+                  autoComplete="new-password"
+                />
+              </label>
+              <label className="form-field" htmlFor="source-bucket">
+                <span>Source bucket name</span>
+                <input
+                  id="source-bucket"
+                  value={sourceBucket}
+                  onChange={(event) => setSourceBucket(event.target.value)}
+                  required
+                />
+              </label>
+            </div>
             <div className="button-row">
-              <button type="submit">Save in memory</button>
+              <button className="primary-button" type="submit">
+                Save in memory
+              </button>
               <button
                 className="secondary-button"
                 type="button"
@@ -358,39 +440,60 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
             </div>
           </form>
           {message && (
-            <p className="success-message" role="status">
+            <p className="feedback feedback-success" role="status">
               {message}
             </p>
           )}
         </section>
-        <section className="card">
-          <h2>Read-only scan</h2>
-          <p>
-            Discover models from <code>roots/primary/&lt;model&gt;/</code>{" "}
-            archive members.
+
+        <section className="card workflow-card">
+          <div className="card-header">
+            <div>
+              <p className="section-kicker">Step 02</p>
+              <h2>Read-only scan</h2>
+            </div>
+            <span className="status-pill is-muted">Deterministic</span>
+          </div>
+          <p className="card-description">
+            Discover models from archive members under the configured source bucket.
           </p>
+          <div className="scan-rule">
+            <span className="scan-rule-label">Matching path</span>
+            <code>roots/primary/&lt;model&gt;/</code>
+          </div>
           <button
+            className="primary-button wide-button"
             type="button"
             onClick={() => void startScan()}
             disabled={!connection.configured || isActive}
           >
-            Start scan
+            {isActive ? "Scan in progress" : "Start scan"}
           </button>
+          {!connection.configured && (
+            <p className="action-note">Save a source connection before starting a scan.</p>
+          )}
           {jobStatus && (
             <div className="progress-panel" aria-live="polite">
-              <p>
-                <strong>Status:</strong> {jobStatus.status}
-              </p>
+              <div className="progress-heading">
+                <span className="section-kicker">Current scan</span>
+                <span className={`status-pill ${isActive ? "is-active" : "is-ready"}`}>
+                  {jobStatus.status}
+                </span>
+              </div>
+              <div className="progress-meta">
+                <strong>{progress}%</strong>
+                <span>
+                  {jobStatus.progress.processed} of {jobStatus.progress.total || "unknown"} objects
+                </span>
+              </div>
               <progress value={progress} max="100">
                 {progress}%
               </progress>
-              <p>
-                {jobStatus.progress.processed} of{" "}
-                {jobStatus.progress.total || "unknown"} objects processed (
-                {jobStatus.progress.failed} failures)
+              <p className="progress-caption">
+                {jobStatus.progress.failed} failures isolated from the scan.
               </p>
               {jobStatus.error && (
-                <p className="error-message">{jobStatus.error}</p>
+                <p className="feedback feedback-error">{jobStatus.error}</p>
               )}
             </div>
           )}

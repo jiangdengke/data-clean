@@ -84,3 +84,53 @@ Rollback: remove the latest-job endpoint/restoration and revert the Dockerfile i
 * `progress.md`：追加本轮实现与验证记录。
 
 回滚方式：删除本轮新增的应用、前端、部署、文档、测试和 R2 扫描规范文件，并删除本条进度记录；未对源桶执行写操作。若仅回退最后修复，恢复 `backend/app.py` 中重复的 `/api/scans/latest` 路由不会改变业务意图，但不建议保留重复注册。
+
+## 2026-10-06 - Task: Refine frontend visual design
+
+### What was done
+
+- Refined the login and dashboard experience toward a restrained, spacious visual system inspired by Apple and Google product interfaces.
+- Added clearer branding, page hierarchy, workflow steps, connection and scan status pills, progress metadata, report statistics, and model detail presentation.
+- Improved form grouping, focus states, responsive layouts, touch behavior, reduced-motion support, and read-only safety messaging without changing API behavior.
+
+### Testing
+
+- `npm --prefix frontend run lint` -> passed TypeScript validation.
+- `npm --prefix frontend run build` -> passed Vite production build.
+- IDE linter diagnostics for `frontend/src/main.tsx` and `frontend/src/styles.css` -> no diagnostics.
+- `git diff --check` -> passed.
+- No backend API behavior or R2 operation was changed.
+
+### Notes
+
+- `frontend/src/main.tsx` - updated presentation structure while preserving login, connection, scan polling, and report data flows.
+- `frontend/src/styles.css` - replaced the basic visual layer with the refined responsive design system.
+- `progress.md` - recorded this frontend redesign and verification evidence.
+
+Rollback: revert `frontend/src/main.tsx` and `frontend/src/styles.css` to the previous commit, then remove this progress entry. The Oracle deployment was not rebuilt or restarted by this frontend-only change.
+
+## 2026-10-06 - Task: Deploy refined frontend to Oracle VM
+
+### What was done
+
+- Uploaded the confirmed frontend presentation changes to the Oracle deployment directory.
+- Rebuilt the ARM64 Docker image on Oracle and restarted the application container.
+- Preserved the loopback-only `127.0.0.1:8000` binding, existing administrator environment file, Nginx configuration, and named report volume.
+
+### Testing
+
+- Oracle Docker Compose container status -> passed.
+- Frontend production build during remote Docker build -> passed.
+- Local session endpoint and page entry -> returned HTTP 200.
+- Administrator login and authenticated connection endpoint -> returned HTTP 200.
+- Existing named data volume -> remained attached.
+- Served page entry references the new frontend asset hashes -> passed.
+- No R2 scan or R2 write operation was executed.
+
+### Notes
+
+- `frontend/src/main.tsx` and `frontend/src/styles.css` - deployed the confirmed visual redesign.
+- `progress.md` - recorded the Oracle frontend deployment and verification evidence.
+- Remote `/home/ubuntu/r2-model-scanner` - rebuilt deployment; server-only `.env` remained outside the repository.
+
+Rollback: on Oracle, restore the previous frontend source files in `/home/ubuntu/r2-model-scanner`, rerun `sudo docker compose --env-file .env up --build -d`, and retain the existing named data volume.
