@@ -1,0 +1,8 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/10-06-r2-model-cleanup-sync/prd.md", "reason": "Verify implementation against requirements and acceptance criteria"}
+{"file": ".trellis/tasks/10-06-r2-model-cleanup-sync/research/r2-copy-strategy.md", "reason": "Check CopyObject correctness and permission caveats"}
+{"file": ".trellis/tasks/10-06-r2-model-cleanup-sync/research/web-deployment-pattern.md", "reason": "Check deployment, session, job, and volume constraints"}
+{"file": ".trellis/spec/backend/quality.md", "reason": "Run backend quality checklist"}
+{"file": ".trellis/spec/frontend/quality.md", "reason": "Run frontend quality checklist"}
+{"file": ".trellis/spec/shared/code-quality.md", "reason": "Check mandatory code quality rules"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Review cross-layer data flow and authentication"}

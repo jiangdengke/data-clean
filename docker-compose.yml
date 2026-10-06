@@ -1,0 +1,15 @@
+services:
+  r2-model-scanner:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the deployment environment}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      DATA_DIRECTORY: /var/lib/r2-model-scanner
+    volumes:
+      - r2-model-scanner-data:/var/lib/r2-model-scanner
+
+volumes:
+  r2-model-scanner-data:
