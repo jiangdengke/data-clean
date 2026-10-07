@@ -326,3 +326,26 @@ Rollback: restore the prior frontend source and rebuild from `/home/ubuntu/r2-mo
 - `progress.md` - recorded the card-based redesign and deployment verification.
 
 Rollback: restore the previous `frontend/src/main.tsx` and `frontend/src/styles.css`, rebuild the Oracle image from `/home/ubuntu/r2-model-scanner`, and retain the named data volume. No R2 data was changed.
+
+## 2026-10-07 - Task: Simplify workspace model scan copy
+
+### What was done
+
+- Removed the dashboard intro labels and slogan, plus the technical `roots/primary/<model>/` path from the scan card.
+- Replaced scan-card copy with the steps: save the connection, test it, then click “开始扫描”; clarified that the scan examines `.tar.gz` archive contents to identify models and does not modify source objects.
+- Preserved the existing manual scan, mapping, target check, and sync workflow. There is no automatic or incremental scan, nor archive-content cleaning; synchronization copies the complete source archive object to mapped target buckets rather than splitting its contents by model.
+
+### Testing
+
+- `npm --prefix frontend run lint` -> passed (`tsc --noEmit`).
+- `npm --prefix frontend run build` -> passed; Vite production build generated successfully.
+- `git diff --check` -> passed.
+- Search of `frontend/src/main.tsx` -> removed intro/path strings absent.
+- No backend/API/scanner behavior changed; no R2 scan or synchronization was executed.
+
+### Notes
+
+- `frontend/src/main.tsx` - simplified dashboard and scan-card copy only.
+- `progress.md` - recorded this implementation and verification.
+
+Rollback: restore the prior scan-card/dashboard text in `frontend/src/main.tsx` and remove this progress entry; no source objects or backend behavior were changed.

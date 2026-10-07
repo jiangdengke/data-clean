@@ -1,0 +1,4 @@
+{"file":".trellis/spec/frontend/index.md","reason":"前端开发约定和规范导航。"}
+{"file":".trellis/spec/frontend/components.md","reason":"语义化 React 组件和可访问性约定。"}
+{"file":".trellis/spec/frontend/css-layout.md","reason":"响应式布局和交互规范。"}
+{"file":".trellis/spec/frontend/quality.md","reason":"前端质量检查要求。"}

@@ -1,0 +1,2 @@
+{"file":".trellis/spec/frontend/quality.md","reason":"验证前端 lint、构建和变更质量。"}
+{"file":".trellis/spec/frontend/css-layout.md","reason":"复核改动对响应式布局的影响。"}
