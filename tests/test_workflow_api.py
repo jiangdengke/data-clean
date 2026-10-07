@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import create_app
 from backend.config import AppSettings
-from backend.models import ScanReport
+from backend.models import ScanReport, SourceObject
 
 
 def create_scan_report() -> ScanReport:
@@ -76,10 +76,13 @@ def test_mapping_preflight_and_sync_use_saved_source_model_mapping(
         connection_response = client.post(
             "/api/connection",
             json={
-                "endpoint": "https://example.invalid",
-                "access_key_id": "access-id",
-                "secret_access_key": "secret-value",
-                "source_buckets": ["招 2"],
+                "connections": [
+                    {
+                        "source_bucket": "招 2",
+                        "endpoint": "https://example.invalid",
+                        "credential_ref": "default",
+                    }
+                ]
             },
         )
         assert connection_response.status_code == 200
@@ -94,6 +97,17 @@ def test_mapping_preflight_and_sync_use_saved_source_model_mapping(
             "targets": [],
         }
 
+        application.state.job_storage.incremental.upsert_object(
+            "招 2", SourceObject("path/file.tar.gz", 10, "etag")
+        )
+        claimed = application.state.job_storage.incremental.claim_next_object()
+        assert claimed is not None
+        assert application.state.job_storage.incremental.complete_classification(
+            int(claimed["id"]),
+            "awaiting_mapping",
+            ("sol",),
+            state="unmapped",
+        )
         mapping_response = client.post(
             "/api/mappings",
             json={
@@ -107,6 +121,7 @@ def test_mapping_preflight_and_sync_use_saved_source_model_mapping(
             },
         )
         assert mapping_response.status_code == 200
+        assert application.state.job_storage.incremental.counts().get("route_pending", 0) == 0
 
         preflight_response = client.post(
             "/api/sync/preflight",

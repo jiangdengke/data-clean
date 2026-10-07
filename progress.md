@@ -349,3 +349,28 @@ Rollback: restore the previous `frontend/src/main.tsx` and `frontend/src/styles.
 - `progress.md` - recorded this implementation and verification.
 
 Rollback: restore the prior scan-card/dashboard text in `frontend/src/main.tsx` and remove this progress entry; no source objects or backend behavior were changed.
+
+## 2026-10-07 - Task: Implement large-scale R2 incremental routing
+
+### What was done
+
+- Added a SQLite WAL-backed object/version index with fingerprint de-duplication, durable object and routing states, bounded retries, and restart claim recovery.
+- Added Cloudflare Queue HTTP pull/ack handling; accepted event payloads are sanitized and committed to SQLite before their leases are acknowledged.
+- Added paginated metadata reconciliation and checkpointed historical backfill with bounded processing, pause/resume controls, and drain-before-complete behavior.
+- Added automatic routing for classified objects with saved mappings, pending state for unmapped models, and no-overwrite target conflicts.
+- Added persisted continuous-mode recovery so enabled queue consumption, reconciliation, and workers resume after restart; deployment runtime secrets remain environment-only and are excluded from SQLite, reports, logs, and UI.
+- Added UI controls and status reporting for continuous routing and historical backfill, including progress, local backlog/failure/conflict counts, Cloudflare Queue backlog count, reconciliation time, readiness, queue timestamps, and unmapped models.
+
+### Testing
+
+- `./.venv/bin/python -m pytest -q` -> passed, 42 tests; existing dependency deprecation warnings remain.
+- `cd frontend && npm run lint && npm run build` -> passed TypeScript validation and Vite production build.
+- `python3 -m compileall -q backend tests` -> passed.
+- Dummy-value `docker compose config --quiet` -> passed; no deployment was started.
+- `git diff --check` -> passed.
+- Verification used mocks and dummy configuration only: no real R2 or Cloudflare Queue calls, deployment, historical backfill, or object copy was performed.
+
+### Notes
+
+- The implementation preserves the existing explicit manual scan/sync workflow alongside incremental routing.
+- Cloudflare Queue/DLQ resources, R2 event rules, production Secret Manager configuration, and live provider validation remain manual deployment concerns.

@@ -8,6 +8,21 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the deployment environment}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
       DATA_DIRECTORY: /var/lib/r2-model-scanner
+      # Provider credentials are optional at process start so the UI can be
+      # deployed in a paused/not-ready state. Inject them through the
+      # deployment environment before enabling scans or continuous routing.
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      # For each non-default UI credential_ref, inject matching
+      # R2_CREDENTIAL_<NORMALIZED_REF>_ACCESS_KEY_ID and _SECRET_ACCESS_KEY here.
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_QUEUE_ID: ${CLOUDFLARE_QUEUE_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      QUEUE_VISIBILITY_TIMEOUT_MS: ${QUEUE_VISIBILITY_TIMEOUT_MS:-60000}
+      QUEUE_BATCH_SIZE: ${QUEUE_BATCH_SIZE:-10}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-3600}
+      INCREMENTAL_WORKER_CONCURRENCY: ${INCREMENTAL_WORKER_CONCURRENCY:-2}
     volumes:
       - r2-model-scanner-data:/var/lib/r2-model-scanner
 

@@ -27,7 +27,7 @@ def test_login_sets_http_only_secure_same_site_cookie(tmp_path: Path) -> None:
         assert "SameSite=lax" in set_cookie
 
 
-def test_connection_response_never_returns_secret_access_key(tmp_path: Path) -> None:
+def test_connection_rejects_raw_runtime_credentials(tmp_path: Path) -> None:
     with create_test_client(tmp_path) as client:
         client.post("/api/login", json={"password": "test-password"})
         response = client.post(
@@ -39,10 +39,32 @@ def test_connection_response_never_returns_secret_access_key(tmp_path: Path) -> 
                 "source_buckets": ["source-bucket"],
             },
         )
-        assert response.status_code == 200
+        assert response.status_code == 422
         assert "secret-value" not in response.text
-        assert response.json() == {
-            "configured": True,
-            "endpoint": "https://example.invalid",
-            "source_buckets": ["source-bucket"],
-        }
+
+
+def test_connection_response_contains_only_non_secret_profile_data(tmp_path: Path) -> None:
+    with create_test_client(tmp_path) as client:
+        client.post("/api/login", json={"password": "test-password"})
+        response = client.post(
+            "/api/connection",
+            json={
+                "connections": [
+                    {
+                        "source_bucket": "source-bucket",
+                        "endpoint": "https://example.invalid",
+                        "credential_ref": "default",
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 200
+        assert "access-id" not in response.text
+        assert "secret-value" not in response.text
+        assert response.json()["connections"] == [
+            {
+                "source_bucket": "source-bucket",
+                "endpoint": "https://example.invalid",
+                "credential_ref": "default",
+            }
+        ]

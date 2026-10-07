@@ -10,13 +10,17 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import AppSettings
+from .incremental import IncrementalService
 from .models import (
     BucketModelMapping,
     ConnectionRequest,
+    ConnectionProfileRequest,
+    ConnectionProfileView,
     ConnectionSettings,
     ConnectionTestResponse,
     ConnectionView,
@@ -27,12 +31,17 @@ from .models import (
     ScanReport,
     SessionResponse,
     SourceBucketReport,
+    SourceConnectionProfile,
     SourceObject,
     StartScanResponse,
     StartSyncResponse,
     SyncResult,
     SyncPreflightResponse,
     TargetBucketCheck,
+    ContinuousModeRequest,
+    BackfillActionRequest,
+    RetryRequest,
+    IncrementalStatusResponse,
 )
 from .r2_client import create_r2_client
 from .scanner import (
@@ -96,16 +105,66 @@ def ensure_same_origin(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-origin request rejected")
 
 
-def get_connection_view(connection_settings: ConnectionSettings | None) -> ConnectionView:
-    """Return connection metadata without exposing either credential."""
-
-    if connection_settings is None:
-        return ConnectionView(configured=False)
-    return ConnectionView(
-        configured=True,
-        endpoint=connection_settings.endpoint,
-        source_buckets=list(connection_settings.source_buckets),
+def resolve_connection_settings(settings: AppSettings, profile: SourceConnectionProfile) -> ConnectionSettings:
+    access_key_id, secret_access_key = settings.resolve_r2_credentials(profile.credential_ref)
+    return ConnectionSettings(
+        endpoint=profile.endpoint,
+        access_key_id=access_key_id,
+        secret_access_key=secret_access_key,
+        source_bucket=profile.source_bucket,
+        credential_ref=profile.credential_ref,
     )
+
+
+def get_connection_view(
+    connection_profiles: tuple[SourceConnectionProfile, ...] | None, settings: AppSettings
+) -> ConnectionView:
+    """Return non-secret profiles and deployment-secret readiness."""
+
+    profiles = connection_profiles or ()
+    credential_refs = tuple(profile.credential_ref for profile in profiles)
+    return ConnectionView(
+        configured=bool(profiles),
+        endpoint=profiles[0].endpoint if profiles else None,
+        source_buckets=[profile.source_bucket for profile in profiles],
+        connections=[
+            ConnectionProfileView(
+                source_bucket=profile.source_bucket,
+                endpoint=profile.endpoint,
+                credential_ref=profile.credential_ref,
+            )
+            for profile in profiles
+        ],
+        runtime_ready=bool(profiles)
+        and all(
+            profile.endpoint.strip() and settings.credentials_ready_for(profile.credential_ref)
+            for profile in profiles
+        )
+        and settings.queue_credentials_ready,
+        readiness_message=(
+            settings.readiness_message_for(
+                credential_refs,
+                tuple(profile.endpoint for profile in profiles),
+            )
+            if profiles
+            else "请先配置至少一个源桶连接"
+        ),
+    )
+
+
+def get_connection_profiles(application: FastAPI) -> tuple[SourceConnectionProfile, ...]:
+    return cast(JobStorage, application.state.job_storage).get_connection_profiles()
+
+
+def get_bucket_client(application: FastAPI, source_bucket: str) -> object:
+    settings = cast(AppSettings, application.state.settings)
+    profile = next(
+        (item for item in get_connection_profiles(application) if item.source_bucket == source_bucket),
+        None,
+    )
+    if profile is None:
+        raise RuntimeError("Source bucket is not configured")
+    return create_r2_client(resolve_connection_settings(settings, profile))
 
 
 def get_required_mapping_pairs(report: ScanReport) -> set[tuple[str, str]]:
@@ -150,11 +209,11 @@ async def run_scan_job(application: FastAPI, job_id: str) -> None:
 
     settings = cast(AppSettings, application.state.settings)
     storage = cast(JobStorage, application.state.job_storage)
-    connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
+    connection_profiles = get_connection_profiles(application)
     existing_job = storage.get_job(job_id)
     if existing_job is None:
         return
-    if connection_settings is None:
+    if not connection_profiles:
         existing_job["status"] = "failed"
         existing_job["error"] = "Connection settings are not configured"
         existing_job["updated_at"] = current_timestamp()
@@ -165,15 +224,17 @@ async def run_scan_job(application: FastAPI, job_id: str) -> None:
         existing_job["status"] = "running"
         existing_job["updated_at"] = current_timestamp()
         storage.save_job(existing_job)
-        r2_client = create_r2_client(connection_settings)
         bucket_objects: list[tuple[str, list[SourceObject]]] = []
+        bucket_clients: dict[str, object] = {}
         bucket_errors: dict[str, str] = {}
         total_object_count = 0
 
-        for source_bucket in connection_settings.source_buckets:
+        for source_bucket in (profile.source_bucket for profile in connection_profiles):
             try:
+                r2_client = get_bucket_client(application, source_bucket)
+                bucket_clients[source_bucket] = r2_client
                 source_objects = await asyncio.to_thread(
-                    lambda bucket=source_bucket: list(r2_client.list_source_objects(bucket))
+                    lambda bucket=source_bucket, client=r2_client: list(client.list_source_objects(bucket))
                 )
             except Exception:
                 source_objects = []
@@ -196,13 +257,17 @@ async def run_scan_job(application: FastAPI, job_id: str) -> None:
             storage.save_job(existing_job)
             outcomes: dict[str, ObjectScanOutcome] = {}
             for source_object in source_objects:
-                outcome = await scan_object_with_retries(
-                    r2_client,
-                    source_bucket,
-                    source_object,
-                    settings.object_timeout_seconds,
-                    settings.object_retry_count,
-                )
+                bucket_client = bucket_clients.get(source_bucket)
+                if bucket_client is None:
+                    outcome = ObjectScanOutcome(classification="failed")
+                else:
+                    outcome = await scan_object_with_retries(
+                        bucket_client,
+                        source_bucket,
+                        source_object,
+                        settings.object_timeout_seconds,
+                        settings.object_retry_count,
+                    )
                 outcomes[source_object.key] = outcome
                 existing_job["progress"]["processed"] += 1
                 if outcome.classification in {"failed", "archive_corrupt", "timed_out"}:
@@ -242,10 +307,9 @@ async def run_sync_job(application: FastAPI, sync_job_id: str, scan_job_id: str)
     """Copy every mapped source object and persist a safe sync report."""
 
     storage = cast(JobStorage, application.state.job_storage)
-    connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
     sync_job = storage.get_job(sync_job_id)
     scan_report = storage.get_report(scan_job_id)
-    if sync_job is None or scan_report is None or connection_settings is None:
+    if sync_job is None or scan_report is None or not get_connection_profiles(application):
         return
 
     try:
@@ -255,10 +319,10 @@ async def run_sync_job(application: FastAPI, sync_job_id: str, scan_job_id: str)
         sync_job["progress"] = {"total": len(actions), "processed": 0, "failed": 0}
         sync_job["updated_at"] = current_timestamp()
         storage.save_job(sync_job)
-        client = create_r2_client(connection_settings)
         results: list[SyncResult] = []
         for action in actions:
             try:
+                client = get_bucket_client(application, action.source_bucket)
                 result = await asyncio.to_thread(execute_sync_action, client, action)
             except Exception:
                 result = create_sync_failure_result(action)
@@ -301,20 +365,50 @@ async def run_sync_job(application: FastAPI, sync_job_id: str, scan_job_id: str)
 
 @asynccontextmanager
 async def application_lifespan(application: FastAPI):
-    """Prepare durable storage and mark unfinished jobs after a restart."""
+    """Recover durable state and run only explicitly enabled incremental services."""
 
-    cast(JobStorage, application.state.job_storage).mark_active_jobs_interrupted()
-    yield
+    storage = cast(JobStorage, application.state.job_storage)
+    storage.mark_active_jobs_interrupted()
+    incremental = cast(IncrementalService, application.state.incremental_service)
+    await incremental.start()
+    try:
+        yield
+    finally:
+        await incremental.stop()
 
 
 def create_app(settings: AppSettings) -> FastAPI:
     """Create an application instance with isolated in-memory runtime state."""
 
     application = FastAPI(title="R2 Model Scanner", lifespan=application_lifespan)
+
+    @application.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # Pydantic's default 422 payload includes the rejected ``input`` field.
+        # That would echo a browser-supplied credential even though the request
+        # contract rejects it. Keep locations/messages/types, never values.
+        detail = [
+            {
+                key: error[key]
+                for key in ("loc", "msg", "type")
+                if key in error
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": detail})
     application.state.settings = settings
     application.state.job_storage = JobStorage(settings.data_directory)
     application.state.session_store = SessionStore(settings.session_max_age_seconds)
+    saved_profiles = cast(JobStorage, application.state.job_storage).get_connection_profiles()
+    application.state.connection_profiles = saved_profiles
     application.state.connection_settings = None
+    application.state.incremental_service = IncrementalService(
+        settings,
+        cast(JobStorage, application.state.job_storage),
+        lambda source_bucket=None: get_bucket_client(application, source_bucket) if source_bucket else None,
+    )
     application.state.active_scan_task = None
     application.state.active_sync_task = None
     application.state.sync_start_lock = asyncio.Lock()
@@ -343,37 +437,52 @@ def create_app(settings: AppSettings) -> FastAPI:
 
     @application.get("/api/connection", response_model=ConnectionView, dependencies=[Depends(require_authenticated_user)])
     async def get_connection() -> ConnectionView:
-        return get_connection_view(cast(ConnectionSettings | None, application.state.connection_settings))
+        return get_connection_view(get_connection_profiles(application), settings)
 
-    @application.post("/api/connection", response_model=ConnectionView, dependencies=[Depends(require_authenticated_user)])
+    @application.post("/api/connection", response_model=None, dependencies=[Depends(require_authenticated_user)])
     async def set_connection(connection_request: ConnectionRequest, request: Request) -> ConnectionView:
         ensure_same_origin(request)
-        normalized_source_buckets = tuple(
-            dict.fromkeys(bucket.strip() for bucket in connection_request.source_buckets if bucket.strip())
-        )
-        if not normalized_source_buckets:
+        if connection_request.connections is not None:
+            raw_profiles = connection_request.connections
+        else:
+            raw_profiles = [
+                ConnectionProfileRequest(
+                    source_bucket=bucket,
+                    endpoint=connection_request.endpoint or "",
+                    credential_ref="default",
+                )
+                for bucket in (connection_request.source_buckets or [])
+            ]
+        profiles: list[SourceConnectionProfile] = []
+        seen_buckets: set[str] = set()
+        for profile in raw_profiles:
+            source_bucket = profile.source_bucket.strip()
+            endpoint = profile.endpoint.strip()
+            credential_ref = profile.credential_ref.strip()
+            if not source_bucket or not endpoint or not credential_ref or source_bucket in seen_buckets:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Each source bucket must have a unique endpoint and credential reference")
+            seen_buckets.add(source_bucket)
+            profiles.append(SourceConnectionProfile(source_bucket, endpoint, credential_ref))
+        if not profiles:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one source bucket is required")
-        application.state.connection_settings = ConnectionSettings(
-            endpoint=connection_request.endpoint,
-            access_key_id=connection_request.access_key_id,
-            secret_access_key=connection_request.secret_access_key,
-            source_buckets=normalized_source_buckets,
-        )
-        return get_connection_view(cast(ConnectionSettings, application.state.connection_settings))
+        storage = cast(JobStorage, application.state.job_storage)
+        storage.save_connection_profiles(tuple(profiles))
+        application.state.connection_profiles = tuple(profiles)
+        return get_connection_view(tuple(profiles), settings)
 
     @application.post("/api/connection/test", response_model=ConnectionTestResponse, dependencies=[Depends(require_authenticated_user)])
     async def test_connection(request: Request) -> ConnectionTestResponse:
         ensure_same_origin(request)
-        connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
-        if connection_settings is None:
+        profiles = get_connection_profiles(application)
+        if not profiles:
             return ConnectionTestResponse(success=False, reason="Configure a source connection first")
-        client = create_r2_client(connection_settings)
         failed_buckets: list[str] = []
-        for source_bucket in connection_settings.source_buckets:
+        for profile in profiles:
             try:
-                await asyncio.to_thread(client.test_source_bucket, source_bucket)
+                client = get_bucket_client(application, profile.source_bucket)
+                await asyncio.to_thread(client.test_source_bucket, profile.source_bucket)
             except Exception:
-                failed_buckets.append(source_bucket)
+                failed_buckets.append(profile.source_bucket)
         if failed_buckets:
             return ConnectionTestResponse(
                 success=False,
@@ -410,13 +519,51 @@ def create_app(settings: AppSettings) -> FastAPI:
         if duplicate_pairs:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Duplicate source bucket and model mapping")
         storage.save_mappings(normalized_mappings)
+        cast(IncrementalService, application.state.incremental_service).enqueue_mapped_routes_if_enabled(normalized_mappings)
         return MappingsResponse(mappings=storage.get_mappings())
+
+    @application.get("/api/incremental/status", response_model=IncrementalStatusResponse, dependencies=[Depends(require_authenticated_user)])
+    async def incremental_status() -> IncrementalStatusResponse:
+        return IncrementalStatusResponse(**cast(IncrementalService, application.state.incremental_service).status())
+
+    @application.post("/api/incremental/continuous", response_model=IncrementalStatusResponse, dependencies=[Depends(require_authenticated_user)])
+    async def set_continuous(request_body: ContinuousModeRequest, request: Request) -> IncrementalStatusResponse:
+        ensure_same_origin(request)
+        service = cast(IncrementalService, application.state.incremental_service)
+        if request_body.enabled and not get_connection_profiles(application):
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Configure at least one source bucket")
+        if request_body.enabled and not service.runtime_ready():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=service.readiness_message(),
+            )
+        service.set_continuous(request_body.enabled)
+        await service.apply_continuous_state()
+        return IncrementalStatusResponse(**service.status())
+
+    @application.post("/api/incremental/backfill", response_model=IncrementalStatusResponse, dependencies=[Depends(require_authenticated_user)])
+    async def backfill_action(request_body: BackfillActionRequest, request: Request) -> IncrementalStatusResponse:
+        ensure_same_origin(request)
+        service = cast(IncrementalService, application.state.incremental_service)
+        if request_body.action == "start":
+            await service.start_backfill()
+        elif request_body.action == "pause":
+            service.pause_backfill()
+        else:
+            await service.start_backfill()
+        return IncrementalStatusResponse(**service.status())
+
+    @application.post("/api/incremental/retry", response_model=IncrementalStatusResponse, dependencies=[Depends(require_authenticated_user)])
+    async def retry_incremental(request_body: RetryRequest, request: Request) -> IncrementalStatusResponse:
+        ensure_same_origin(request)
+        cast(IncrementalService, application.state.incremental_service).store.retry_failed(request_body.object_id)
+        return IncrementalStatusResponse(**cast(IncrementalService, application.state.incremental_service).status())
 
     @application.post("/api/scans", response_model=StartScanResponse, status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_authenticated_user)])
     async def start_scan(request: Request) -> StartScanResponse:
         ensure_same_origin(request)
-        connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
-        if connection_settings is None:
+        connection_profiles = get_connection_profiles(application)
+        if not connection_profiles:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Configure a source connection first")
         active_scan_task = cast(asyncio.Task[None] | None, application.state.active_scan_task)
         if active_scan_task is not None and not active_scan_task.done():
@@ -426,7 +573,7 @@ def create_app(settings: AppSettings) -> FastAPI:
             "job_id": job_id,
             "job_type": "scan",
             "status": "queued",
-            "source_buckets": list(connection_settings.source_buckets),
+            "source_buckets": [profile.source_bucket for profile in connection_profiles],
             "current_source_bucket": None,
             "progress": {"total": 0, "processed": 0, "failed": 0},
             "report_available": False,
@@ -465,8 +612,8 @@ def create_app(settings: AppSettings) -> FastAPI:
     @application.post("/api/sync/preflight", response_model=SyncPreflightResponse, dependencies=[Depends(require_authenticated_user)])
     async def sync_preflight(scan_reference: ScanReferenceRequest, request: Request) -> SyncPreflightResponse:
         ensure_same_origin(request)
-        connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
-        if connection_settings is None:
+        connection_profiles = get_connection_profiles(application)
+        if not connection_profiles:
             return SyncPreflightResponse(success=False, reason="Connection settings are not configured")
         scan_report = cast(JobStorage, application.state.job_storage).get_report(normalize_job_id(scan_reference.scan_job_id))
         if scan_report is None:
@@ -475,7 +622,7 @@ def create_app(settings: AppSettings) -> FastAPI:
             bucket_report["source_bucket"]
             for bucket_report in scan_report["source_buckets"]
         }
-        configured_source_buckets = set(connection_settings.source_buckets)
+        configured_source_buckets = {profile.source_bucket for profile in connection_profiles}
         if report_source_buckets != configured_source_buckets:
             return SyncPreflightResponse(
                 success=False,
@@ -488,21 +635,35 @@ def create_app(settings: AppSettings) -> FastAPI:
         if missing_mappings:
             return SyncPreflightResponse(success=False, reason="Some discovered models do not have target buckets")
         required_pairs = get_required_mapping_pairs(scan_report)
-        target_buckets = sorted(
-            {
-                mapping.target_bucket
-                for mapping in mappings
-                if (mapping.source_bucket, mapping.model_name) in required_pairs
-            }
-        )
-        client = create_r2_client(connection_settings)
+        target_sources: dict[str, set[str]] = {}
+        for mapping in mappings:
+            if (mapping.source_bucket, mapping.model_name) in required_pairs:
+                target_sources.setdefault(mapping.target_bucket, set()).add(mapping.source_bucket)
         target_checks: list[TargetBucketCheck] = []
-        for target_bucket in target_buckets:
-            try:
-                await asyncio.to_thread(client.test_source_bucket, target_bucket)
-                target_checks.append(TargetBucketCheck(target_bucket=target_bucket, accessible=True, reason="Target bucket is accessible"))
-            except Exception:
-                target_checks.append(TargetBucketCheck(target_bucket=target_bucket, accessible=False, reason="Target bucket is not accessible"))
+        for target_bucket in sorted(target_sources):
+            failed_sources: list[str] = []
+            for source_bucket in sorted(target_sources[target_bucket]):
+                try:
+                    client = get_bucket_client(application, source_bucket)
+                    await asyncio.to_thread(client.test_source_bucket, target_bucket)
+                except Exception:
+                    failed_sources.append(source_bucket)
+            if failed_sources:
+                target_checks.append(
+                    TargetBucketCheck(
+                        target_bucket=target_bucket,
+                        accessible=False,
+                        reason="Target bucket is not accessible",
+                    )
+                )
+            else:
+                target_checks.append(
+                    TargetBucketCheck(
+                        target_bucket=target_bucket,
+                        accessible=True,
+                        reason="Target bucket is accessible",
+                    )
+                )
         success = all(check.accessible for check in target_checks)
         return SyncPreflightResponse(
             success=success,

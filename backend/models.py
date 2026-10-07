@@ -3,30 +3,58 @@
 from dataclasses import dataclass
 from typing import TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 @dataclass(frozen=True)
 class ConnectionSettings:
-    """R2 settings kept only in the running process."""
+    """Resolved bucket-specific R2 client settings; secrets stay process-local."""
 
     endpoint: str
-    access_key_id: str
-    secret_access_key: str
-    source_buckets: tuple[str, ...]
+    access_key_id: str = ""
+    secret_access_key: str = ""
+    source_bucket: str = ""
+    credential_ref: str = "default"
+    source_buckets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SourceConnectionProfile:
+    """Persistable per-source-bucket configuration with no secret material."""
+
+    source_bucket: str
+    endpoint: str
+    credential_ref: str = "default"
 
 
 @dataclass(frozen=True)
 class SourceObject:
-    """Credential-free source object metadata returned by object listing."""
+    """Credential-free source object metadata returned by listing or HEAD."""
 
     key: str
     size: int
+    etag: str | None = None
+    last_modified: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the stable metadata version key used for idempotency.
+
+        ``LastModified`` is useful for reconciliation diagnostics, but event
+        delivery timestamps are not object version identifiers.  Including it
+        here would turn duplicate notifications for the same object into new
+        work items.  ETag + size are the provider's version clues; ETag is not
+        interpreted as an MD5 digest.
+        """
+
+        return f"{self.etag or ''}:{self.size}"
 
 
 class ObjectReference(TypedDict):
     key: str
     size: int
+    etag: str | None
+    last_modified: str | None
 
 
 class FailedObject(TypedDict):
@@ -88,13 +116,47 @@ class LoginRequest(BaseModel):
 
 
 class ConnectionRequest(BaseModel):
+    """Non-secret profiles, with the old aggregate shape accepted for migration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    connections: list["ConnectionProfileRequest"] | None = None
+    endpoint: str | None = None
+    source_buckets: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_connection_shape(self) -> "ConnectionRequest":
+        if self.connections is None and (not self.endpoint or not self.source_buckets):
+            raise ValueError("Provide per-bucket connections or legacy endpoint and source_buckets")
+        if self.connections is not None and (self.endpoint is not None or self.source_buckets is not None):
+            raise ValueError("Do not mix per-bucket connections with legacy fields")
+        return self
+
+
+class ConnectionProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_bucket: str = Field(min_length=1)
     endpoint: str = Field(min_length=1)
-    access_key_id: str = Field(min_length=1)
-    secret_access_key: str = Field(min_length=1)
-    source_buckets: list[str] = Field(min_length=1)
+    credential_ref: str = Field(min_length=1, pattern="^[A-Za-z0-9_-]+$")
+
+
+class ConnectionProfileView(ConnectionProfileRequest):
+    pass
 
 
 class ConnectionView(BaseModel):
+    configured: bool
+    endpoint: str | None = None
+    source_buckets: list[str] = Field(default_factory=list)
+    connections: list[ConnectionProfileView] = Field(default_factory=list)
+    runtime_ready: bool = False
+    readiness_message: str = ""
+
+
+class SavedConnectionView(BaseModel):
+    """Compact compatibility response for the save form; never contains secrets."""
+
     configured: bool
     endpoint: str | None = None
     source_buckets: list[str] = Field(default_factory=list)
@@ -147,3 +209,29 @@ class StartSyncResponse(BaseModel):
 
 class SessionResponse(BaseModel):
     authenticated: bool
+
+
+class ContinuousModeRequest(BaseModel):
+    enabled: bool
+
+
+class BackfillActionRequest(BaseModel):
+    action: str = Field(pattern="^(start|pause|resume)$")
+
+
+class RetryRequest(BaseModel):
+    object_id: int | None = Field(default=None, ge=1)
+
+
+class IncrementalStatusResponse(BaseModel):
+    continuous_enabled: bool
+    paused: bool
+    runtime_ready: bool
+    readiness_message: str
+    backfill: dict[str, object]
+    counts: dict[str, int]
+    queue_last_pull_at: str | None = None
+    queue_last_ack_at: str | None = None
+    queue_backlog_count: int | None = Field(default=None, ge=0)
+    reconcile_last_run_at: str | None = None
+    last_error: str | None = None

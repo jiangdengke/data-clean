@@ -72,7 +72,11 @@ def scan_object_once(
     if not source_object.key.lower().endswith(".tar.gz"):
         return ObjectScanOutcome(classification="non_archive")
 
-    object_body = client.open_object(source_bucket, source_object.key)
+    conditional_reader = getattr(client, "open_object_conditional", None)
+    if callable(conditional_reader):
+        object_body = conditional_reader(source_bucket, source_object.key, source_object.etag)
+    else:
+        object_body = client.open_object(source_bucket, source_object.key)
     try:
         model_names = discover_models_from_archive(object_body)
     finally:

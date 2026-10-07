@@ -3,10 +3,14 @@ import { createRoot } from "react-dom/client";
 import type { FormEvent } from "react";
 import "./styles.css";
 
+type ConnectionProfile = { source_bucket: string; endpoint: string; credential_ref: string };
 type ConnectionView = {
   configured: boolean;
   endpoint: string | null;
   source_buckets: string[];
+  connections: ConnectionProfile[];
+  runtime_ready?: boolean;
+  readiness_message?: string;
 };
 
 type Progress = { total: number; processed: number; failed: number };
@@ -55,6 +59,19 @@ type SyncReport = {
   copied: number;
   skipped: number;
   failed: number;
+};
+type IncrementalStatus = {
+  continuous_enabled: boolean;
+  paused: boolean;
+  runtime_ready: boolean;
+  readiness_message: string;
+  backfill: { status: string; total_seen?: number; total_classified?: number; source_bucket?: string | null; error_code?: string | null };
+  counts: Record<string, number>;
+  queue_last_pull_at: string | null;
+  queue_last_ack_at: string | null;
+  queue_backlog_count: number | null;
+  reconcile_last_run_at: string | null;
+  last_error: string | null;
 };
 
 async function callApi<ResponseBody>(path: string, init?: RequestInit): Promise<ResponseBody> {
@@ -273,12 +290,83 @@ function ReportView({
   );
 }
 
+type ConnectionProfilesProps = {
+  connections: ConnectionProfile[];
+  canTest: boolean;
+  onUpdate: (index: number, field: keyof ConnectionProfile, value: string) => void;
+  onAdd: () => void;
+  onRemove: (index: number) => void;
+  onSave: (event: FormEvent<HTMLFormElement>) => void | Promise<void>;
+  onTest: () => void | Promise<void>;
+};
+
+function ConnectionProfiles({ connections, canTest, onUpdate, onAdd, onRemove, onSave, onTest }: ConnectionProfilesProps): React.JSX.Element {
+  return (
+    <form className="connection-form" onSubmit={(event) => void onSave(event)}>
+      <div className="connection-profiles" aria-label="源桶连接列表">
+        {connections.map((profile, index) => {
+          const bucketName = profile.source_bucket.trim() || `未命名源桶 ${index + 1}`;
+          const endpointReady = Boolean(profile.endpoint.trim());
+          const credentialReady = Boolean(profile.credential_ref.trim());
+          const isConfigured = Boolean(profile.source_bucket.trim() && endpointReady && credentialReady);
+          const detailId = `connection-editor-${index}`;
+
+          return (
+            <details className="connection-profile" key={`connection-${index}`}>
+              <summary className="connection-profile-summary" aria-label={`打开 ${bucketName} 的连接详情`} aria-controls={detailId}>
+                <span className="connection-profile-summary-main">
+                  <span className="connection-profile-kicker">源桶连接 {index + 1}</span>
+                  <span className="connection-profile-name">{bucketName}</span>
+                  <span className="connection-profile-stats" aria-label="连接摘要">
+                    <span><strong>{endpointReady ? "已设置" : "待填写"}</strong><small>R2 endpoint</small></span>
+                    <span><strong>{credentialReady ? profile.credential_ref : "未设置"}</strong><small>Secret ref</small></span>
+                  </span>
+                </span>
+                <span className="connection-profile-summary-side">
+                  <span className={`bucket-status ${isConfigured ? "is-ready" : "is-pending"}`}>{isConfigured ? "已配置" : "待配置"}</span>
+                  <span className="connection-profile-edit" aria-hidden="true">编辑</span>
+                </span>
+              </summary>
+              <div className="connection-profile-editor" id={detailId}>
+                <div className="connection-profile-editor-header">
+                  <div><p className="section-kicker">连接详情</p><h3>编辑 {bucketName}</h3></div>
+                  <span className="connection-profile-editor-note">仅保存部署 Secret 引用</span>
+                </div>
+                <div className="connection-profile-fields">
+                  <label className="form-field" htmlFor={`source-bucket-${index}`}>
+                    <span>源存储桶</span>
+                    <input id={`source-bucket-${index}`} value={profile.source_bucket} onChange={(event) => onUpdate(index, "source_bucket", event.target.value)} placeholder="例如：source-a" autoComplete="off" required />
+                  </label>
+                  <label className="form-field" htmlFor={`r2-endpoint-${index}`}>
+                    <span>R2 endpoint</span>
+                    <input id={`r2-endpoint-${index}`} type="url" value={profile.endpoint} onChange={(event) => onUpdate(index, "endpoint", event.target.value)} placeholder="https://<account-id>.r2.cloudflarestorage.com" autoComplete="url" required />
+                  </label>
+                  <label className="form-field" htmlFor={`credential-ref-${index}`}>
+                    <span>Secret 配置引用</span>
+                    <input id={`credential-ref-${index}`} value={profile.credential_ref} onChange={(event) => onUpdate(index, "credential_ref", event.target.value)} placeholder="default" pattern="[A-Za-z0-9_-]+" autoComplete="off" required />
+                    <small>例如 default 或 team_a；真实密钥由部署环境注入，不会在此页面回显。</small>
+                  </label>
+                </div>
+                <button className="connection-profile-remove" type="button" onClick={() => onRemove(index)} disabled={connections.length <= 1} aria-label={`移除 ${bucketName} 源桶连接`} title={connections.length <= 1 ? "至少保留一个源桶连接" : `移除 ${bucketName}`}>
+                  {connections.length <= 1 ? "至少保留一个源桶" : "移除源桶"}
+                </button>
+              </div>
+            </details>
+          );
+        })}
+      </div>
+      <button className="text-button connection-add-button" type="button" onClick={onAdd} aria-label="添加源桶连接">+ 添加源桶</button>
+      <div className="button-row">
+        <button className="primary-button" type="submit" aria-label="保存源桶连接配置">保存连接</button>
+        <button className="secondary-button" type="button" onClick={() => void onTest()} disabled={!canTest} aria-label="测试源桶连接">测试连接</button>
+      </div>
+    </form>
+  );
+}
+
 function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
-  const [connection, setConnection] = useState<ConnectionView>({ configured: false, endpoint: null, source_buckets: [] });
-  const [endpoint, setEndpoint] = useState("");
-  const [accessKeyId, setAccessKeyId] = useState("");
-  const [secretAccessKey, setSecretAccessKey] = useState("");
-  const [sourceBuckets, setSourceBuckets] = useState<string[]>([""]);
+  const [connection, setConnection] = useState<ConnectionView>({ configured: false, endpoint: null, source_buckets: [], connections: [] });
+  const [connections, setConnections] = useState<ConnectionProfile[]>([{ source_bucket: "", endpoint: "", credential_ref: "default" }]);
   const [message, setMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [scanJob, setScanJob] = useState<JobStatus | null>(null);
@@ -287,10 +375,11 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
   const [syncJob, setSyncJob] = useState<JobStatus | null>(null);
   const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
   const [preflight, setPreflight] = useState<SyncPreflight | null>(null);
+  const [incremental, setIncremental] = useState<IncrementalStatus | null>(null);
 
   useEffect(() => {
-    void Promise.all([callApi<ConnectionView>("/api/connection"), callApi<{ mappings: Mapping[] }>("/api/mappings"), callApi<JobStatus | null>("/api/scans/latest"), callApi<JobStatus | null>("/api/sync/latest")]).then(([savedConnection, savedMappings, latestScan, latestSync]) => {
-      setConnection(savedConnection); setEndpoint(savedConnection.endpoint ?? ""); setSourceBuckets(savedConnection.source_buckets.length ? savedConnection.source_buckets : [""]); setMappings(savedMappings.mappings); if (latestScan) setScanJob(latestScan); if (latestSync) setSyncJob(latestSync);
+    void Promise.all([callApi<ConnectionView>("/api/connection"), callApi<{ mappings: Mapping[] }>("/api/mappings"), callApi<JobStatus | null>("/api/scans/latest"), callApi<JobStatus | null>("/api/sync/latest"), callApi<IncrementalStatus>("/api/incremental/status")]).then(([savedConnection, savedMappings, latestScan, latestSync, savedIncremental]) => {
+      setConnection(savedConnection); setConnections(savedConnection.connections.length ? savedConnection.connections : savedConnection.source_buckets.map((source_bucket) => ({ source_bucket, endpoint: savedConnection.endpoint ?? "", credential_ref: "default" }))); setMappings(savedMappings.mappings); setIncremental(savedIncremental); if (latestScan) setScanJob(latestScan); if (latestSync) setSyncJob(latestSync);
     }).catch((error: unknown) => setErrorMessage(localizedError(error, "无法读取工作区状态，请刷新页面重试。")));
   }, []);
 
@@ -316,18 +405,21 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
     void callApi<SyncReport>(`/api/sync/${syncJob.sync_job_id ?? syncJob.job_id}/report`).then(setSyncReport).catch((error: unknown) => setErrorMessage(localizedError(error, "无法读取同步报告。")));
   }, [syncJob?.job_id, syncJob?.report_available]);
 
-  function updateSourceBucket(index: number, value: string): void { setSourceBuckets((currentBuckets) => currentBuckets.map((bucket, bucketIndex) => bucketIndex === index ? value : bucket)); }
+  function updateConnection(index: number, field: keyof ConnectionProfile, value: string): void { setConnections((current) => current.map((profile, profileIndex) => profileIndex === index ? { ...profile, [field]: value } : profile)); }
   function updateMapping(sourceBucket: string, modelName: string, targetBucket: string): void { setMappings((currentMappings) => currentMappings.map((mapping) => mapping.source_bucket === sourceBucket && mapping.model_name === modelName ? { ...mapping, target_bucket: targetBucket } : mapping)); setPreflight(null); }
 
   async function saveConnection(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    try { const saved = await callApi<ConnectionView>("/api/connection", { method: "POST", body: JSON.stringify({ endpoint, access_key_id: accessKeyId, secret_access_key: secretAccessKey, source_buckets: sourceBuckets }) }); setConnection(saved); setSourceBuckets(saved.source_buckets); setAccessKeyId(""); setSecretAccessKey(""); setScanReport(null); setPreflight(null); setSyncReport(null); setSyncJob(null); setErrorMessage(""); setMessage("连接信息已保存。密钥只在服务运行期间保留。"); } catch (error) { setErrorMessage(localizedError(error, "保存连接信息失败，请检查填写内容。")); }
+    try { const saved = await callApi<ConnectionView>("/api/connection", { method: "POST", body: JSON.stringify({ connections }) }); setConnection(saved); setConnections(saved.connections); setScanReport(null); setPreflight(null); setSyncReport(null); setSyncJob(null); setErrorMessage(""); setMessage("源桶连接配置已保存。运行凭据仅由部署环境提供。"); } catch (error) { setErrorMessage(localizedError(error, "保存源桶配置失败，请检查填写内容。")); }
   }
   async function testConnection(): Promise<void> { try { const result = await callApi<{ success: boolean; reason: string }>("/api/connection/test", { method: "POST" }); if (result.success) { setErrorMessage(""); setMessage(translateMessage(result.reason, "连接测试已完成。")); } else { setMessage(""); setErrorMessage(translateMessage(result.reason, "连接测试失败，请检查连接信息。")); } } catch (error) { setErrorMessage(localizedError(error, "连接测试失败，请检查连接信息。")); } }
   async function startScan(): Promise<void> { try { const startedJob = await callApi<{ job_id: string; status: string }>("/api/scans", { method: "POST" }); setScanReport(null); setScanJob({ job_id: startedJob.job_id, status: startedJob.status, progress: { total: 0, processed: 0, failed: 0 }, report_available: false, error: null }); setMessage("扫描任务已启动。"); } catch (error) { setErrorMessage(localizedError(error, "无法启动扫描。")); } }
   async function saveMappings(): Promise<void> { try { const saved = await callApi<{ mappings: Mapping[] }>("/api/mappings", { method: "POST", body: JSON.stringify({ mappings }) }); setMappings(saved.mappings); setPreflight(null); setErrorMessage(""); setMessage("模型到目标桶的映射已保存。"); } catch (error) { setErrorMessage(localizedError(error, "保存映射失败。")); } }
   async function checkTargets(): Promise<void> { if (!scanJob) return; try { const result = await callApi<SyncPreflight>("/api/sync/preflight", { method: "POST", body: JSON.stringify({ scan_job_id: scanJob.job_id }) }); setPreflight(result); setMessage(translateMessage(result.reason, result.reason)); } catch (error) { setErrorMessage(localizedError(error, "目标桶检查失败。")); } }
   async function startSync(): Promise<void> { if (!scanJob) return; try { const startedJob = await callApi<{ sync_job_id: string; status: string }>("/api/sync", { method: "POST", body: JSON.stringify({ scan_job_id: scanJob.job_id }) }); setSyncReport(null); setSyncJob({ job_id: startedJob.sync_job_id, sync_job_id: startedJob.sync_job_id, status: startedJob.status, progress: { total: 0, processed: 0, failed: 0 }, report_available: false, error: null }); setMessage("同步任务已启动。已有对象会自动跳过，不会覆盖。"); } catch (error) { setErrorMessage(localizedError(error, "无法启动同步，请先通过目标桶检查。")); } }
+  async function setContinuous(enabled: boolean): Promise<void> { try { const result = await callApi<IncrementalStatus>("/api/incremental/continuous", { method: "POST", body: JSON.stringify({ enabled }) }); setIncremental(result); setMessage(enabled ? "持续分流已开启。" : "持续分流已暂停。"); } catch (error) { setErrorMessage(localizedError(error, "无法更新持续分流状态。")); } }
+  async function backfill(action: "start" | "pause" | "resume"): Promise<void> { try { const result = await callApi<IncrementalStatus>("/api/incremental/backfill", { method: "POST", body: JSON.stringify({ action }) }); setIncremental(result); setMessage("历史回填状态已更新。"); } catch (error) { setErrorMessage(localizedError(error, "无法更新历史回填。")); } }
+  async function refreshIncremental(): Promise<void> { try { setIncremental(await callApi<IncrementalStatus>("/api/incremental/status")); } catch (error) { setErrorMessage(localizedError(error, "无法读取持续分流状态。")); } }
   async function logout(): Promise<void> { try { await callApi("/api/logout", { method: "POST" }); onLogout(); } catch (error) { setErrorMessage(localizedError(error, "退出登录失败。")); } }
 
   const scanActive = scanJob !== null && ["queued", "running"].includes(scanJob.status);
@@ -343,10 +435,11 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
       {errorMessage && <p className="feedback feedback-error page-feedback" role="alert">{errorMessage}</p>}
       {message && <p className="feedback feedback-success page-feedback" role="status">{message}</p>}
       <div className="dashboard-grid">
-        <section className="card workflow-card"><div className="card-header"><div><p className="section-kicker">01 / 连接</p><h2>配置源存储桶</h2></div><span className={`connection-state ${connection.configured ? "is-configured" : ""}`}>{connection.configured ? "已配置" : "未配置"}</span></div><p className="card-description">多个源桶共用同一组 R2 连接信息。请先手动创建目标桶。</p><form className="connection-form" onSubmit={(event) => void saveConnection(event)}><div className="field-grid"><label className="form-field" htmlFor="endpoint"><span>R2 服务地址</span><input id="endpoint" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} required placeholder="https://<account-id>.r2.cloudflarestorage.com" /></label><label className="form-field" htmlFor="access-key-id"><span>访问密钥 ID</span><input id="access-key-id" value={accessKeyId} onChange={(event) => setAccessKeyId(event.target.value)} required autoComplete="off" /></label><label className="form-field" htmlFor="secret-access-key"><span>私密访问密钥</span><input id="secret-access-key" type="password" value={secretAccessKey} onChange={(event) => setSecretAccessKey(event.target.value)} required autoComplete="new-password" /></label></div><div className="bucket-inputs"><div className="form-field"><span>源存储桶名称</span>{sourceBuckets.map((bucket, index) => <div className="bucket-input-row" key={`source-${index}`}><input aria-label={`源存储桶 ${index + 1}`} value={bucket} onChange={(event) => updateSourceBucket(index, event.target.value)} placeholder={index === 0 ? "例如：招 2" : "例如：招 3"} />{sourceBuckets.length > 1 && <button className="icon-button" type="button" aria-label={`删除源桶 ${index + 1}`} onClick={() => setSourceBuckets((currentBuckets) => currentBuckets.filter((_, bucketIndex) => bucketIndex !== index))}>−</button>}</div>)}<button className="text-button" type="button" onClick={() => setSourceBuckets((currentBuckets) => [...currentBuckets, ""])}>+ 添加源桶</button></div></div><div className="button-row"><button className="primary-button" type="submit">保存连接</button><button className="secondary-button" type="button" onClick={() => void testConnection()} disabled={!connection.configured}>测试连接</button></div></form></section>
+        <section className="card workflow-card"><div className="card-header"><div><p className="section-kicker">01 / 连接</p><h2>配置源存储桶</h2></div><span className={`connection-state ${connection.configured ? "is-configured" : ""}`}>{connection.configured ? "已配置" : "未配置"}</span></div><p className="card-description">先选择一个源桶卡片，再在详情面板中编辑连接信息。访问密钥只由部署环境注入，不会在浏览器、SQLite、报告或日志中出现。</p><ConnectionProfiles connections={connections} canTest={connection.configured} onUpdate={updateConnection} onAdd={() => setConnections((current) => [...current, { source_bucket: "", endpoint: "", credential_ref: "default" }])} onRemove={(index) => setConnections((current) => current.filter((_, profileIndex) => profileIndex !== index))} onSave={saveConnection} onTest={testConnection} /></section>
         <section className="card workflow-card"><div className="card-header"><div><p className="section-kicker">02 / 扫描</p><h2>识别每个源桶里的模型</h2></div></div><p className="card-description">保存连接后先点击“测试连接”，再点击“开始扫描”。扫描会检查 .tar.gz 归档内容以识别模型，不会修改源对象。</p><button className="primary-button wide-button" type="button" onClick={() => void startScan()} disabled={!connection.configured || scanActive}>{scanActive ? "正在扫描…" : "开始扫描"}</button>{scanJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">扫描进度</span><span className={`scan-state ${scanActive ? "is-running" : ""}`}>{getStatusLabel(scanJob.status)}</span></div>{scanJob.current_source_bucket && <p className="progress-caption">当前源桶：{scanJob.current_source_bucket}</p>}<div className="progress-meta"><strong>{scanProgress}%</strong><span>已处理 {scanJob.progress.processed} / {scanJob.progress.total || "等待统计"} 个对象</span></div><progress value={scanProgress} max="100">{scanProgress}%</progress><p className="progress-caption">已隔离 {scanJob.progress.failed} 个异常对象，其余对象会继续扫描。</p></div>}</section>
       </div>
       {scanReport && <ReportView report={scanReport} mappings={mappings} missingMappings={missingMappings} preflight={preflight} onMappingChange={updateMapping} onSaveMappings={() => void saveMappings()} onCheckTargets={() => void checkTargets()} />}
+      <section className="card incremental-card"><div className="card-header"><div><p className="section-kicker">03 / 持续分流</p><h2>增量路由与历史回填</h2></div><label className="toggle-label"><input type="checkbox" checked={incremental?.continuous_enabled ?? false} onChange={(event) => void setContinuous(event.target.checked)} disabled={!incremental?.runtime_ready} /><span>自动分流</span></label></div><p className="card-description">运行密钥来自部署环境，不会在浏览器或数据卷保存。持续模式只读取新/变化归档并整包复制；历史回填需手动启动，列表和归档读取会产生 R2 请求成本。</p>{incremental && !incremental.runtime_ready && <p className="feedback feedback-error">{incremental.readiness_message}</p>}<div className="incremental-summary"><span>待处理 {incremental?.counts.queued ?? 0}</span><span>未映射 {incremental?.counts.unmapped ?? 0}</span><span>失败 {incremental?.counts.failed ?? 0}</span><span>冲突 {incremental?.counts.route_conflict ?? 0}</span><span>队列积压 {incremental?.queue_backlog_count ?? "未知"}</span></div><div className="button-row"><button className="secondary-button" type="button" onClick={() => void backfill("start")}>开始回填</button><button className="secondary-button" type="button" onClick={() => void backfill(incremental?.backfill.status === "paused" ? "resume" : "pause")}>{incremental?.backfill.status === "paused" ? "恢复回填" : "暂停回填"}</button><button className="text-button" type="button" onClick={() => void refreshIncremental()}>刷新状态</button></div><p className="report-footnote">回填状态：{incremental?.backfill.status ?? "idle"} · 已列举 {incremental?.backfill.total_seen ?? 0} 个对象 · 已分类 {incremental?.backfill.total_classified ?? 0} 个 · 对账：{incremental?.reconcile_last_run_at ?? "尚未运行"}</p><p className="report-footnote">队列拉取：{incremental?.queue_last_pull_at ?? "尚未运行"} · 队列确认：{incremental?.queue_last_ack_at ?? "尚未运行"}</p>{(incremental?.last_error || incremental?.backfill.error_code) && <p className="feedback feedback-error">最近错误：{incremental.last_error ?? incremental.backfill.error_code}</p>}</section>
       {scanReport && <section className="card sync-card"><div className="card-header"><div><p className="section-kicker">04 / 运行</p><h2>开始同步</h2></div><span className="connection-state">不会覆盖已有对象</span></div><p className="card-description">程序会在 R2 内部复制完整对象，保留原 object key。目标桶已有同名对象时自动跳过。</p><button className="primary-button wide-button" type="button" onClick={() => void startSync()} disabled={!preflight?.success || syncActive}>{syncActive ? "正在同步…" : "开始同步"}</button>{!preflight?.success && <p className="action-note">请先保存完整映射，并点击“检查目标桶”。</p>}{syncJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">同步进度</span><span className={`scan-state ${syncActive ? "is-running" : ""}`}>{getStatusLabel(syncJob.status)}</span></div><div className="progress-meta"><strong>{syncProgress}%</strong><span>已处理 {syncJob.progress.processed} / {syncJob.progress.total || "等待统计"} 个复制动作</span></div><progress value={syncProgress} max="100">{syncProgress}%</progress>{syncJob.error && <p className="feedback feedback-error">{translateMessage(syncJob.error, "同步未能完成。")}</p>}</div>}{syncReport && <p className="report-footnote">复制 {syncReport.copied} 项 · 跳过 {syncReport.skipped} 项 · 失败 {syncReport.failed} 项</p>}</section>}
     </main>
   );

@@ -1,7 +1,7 @@
-"""R2 client abstractions for scanning, preflight, and explicit copies."""
+"""S3-compatible R2 access and Cloudflare Queue HTTP pull primitives."""
 
 from collections.abc import Iterator
-from typing import BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Protocol, cast
 
 import boto3
 from botocore.client import Config
@@ -11,32 +11,17 @@ from .models import ConnectionSettings, SourceObject
 
 
 class R2Client(Protocol):
-    """The R2 operations required by scanning, preflight, and synchronization."""
-
-    def test_source_bucket(self, bucket_name: str) -> None:
-        """Validate that a known source bucket can be accessed."""
-
-    def list_source_objects(self, bucket_name: str) -> Iterator[SourceObject]:
-        """Yield source object metadata from a known bucket."""
-
-    def open_object(self, bucket_name: str, object_key: str) -> BinaryIO:
-        """Open one source object as a streaming binary file."""
-
-    def object_exists(self, bucket_name: str, object_key: str) -> bool:
-        """Check whether a destination object already exists."""
-
-    def copy_object(
-        self,
-        source_bucket: str,
-        source_key: str,
-        target_bucket: str,
-        target_key: str,
-    ) -> None:
-        """Copy one complete source object to a target bucket."""
+    def test_source_bucket(self, bucket_name: str) -> None: ...
+    def list_source_objects(self, bucket_name: str) -> Iterator[SourceObject]: ...
+    def open_object(self, bucket_name: str, object_key: str) -> BinaryIO: ...
+    def open_object_conditional(self, bucket_name: str, object_key: str, etag: str | None = None) -> BinaryIO: ...
+    def head_object(self, bucket_name: str, object_key: str) -> SourceObject: ...
+    def object_exists(self, bucket_name: str, object_key: str) -> bool: ...
+    def copy_object(self, source_bucket: str, source_key: str, target_bucket: str, target_key: str) -> None: ...
 
 
 class Boto3R2Client:
-    """S3-compatible client for source reads and explicit server-side copies."""
+    """R2 client. Copy remains server-side and target operations never overwrite."""
 
     def __init__(self, connection_settings: ConnectionSettings) -> None:
         self._client = boto3.client(
@@ -45,36 +30,71 @@ class Boto3R2Client:
             aws_access_key_id=connection_settings.access_key_id,
             aws_secret_access_key=connection_settings.secret_access_key,
             region_name="auto",
-            config=Config(
-                connect_timeout=120,
-                read_timeout=120,
-                retries={"max_attempts": 0},
-            ),
+            config=Config(connect_timeout=120, read_timeout=120, retries={"max_attempts": 0}),
         )
 
     def test_source_bucket(self, bucket_name: str) -> None:
         self._client.head_bucket(Bucket=bucket_name)
 
+    def _source_object_from_raw(self, raw_object: dict[str, Any]) -> SourceObject | None:
+        object_key = raw_object.get("Key")
+        object_size = raw_object.get("Size")
+        if not isinstance(object_key, str) or not isinstance(object_size, int):
+            return None
+        etag = raw_object.get("ETag")
+        last_modified = raw_object.get("LastModified")
+        return SourceObject(
+            key=object_key,
+            size=object_size,
+            etag=str(etag) if etag is not None else None,
+            last_modified=last_modified.isoformat() if hasattr(last_modified, "isoformat") else (str(last_modified) if last_modified else None),
+        )
+
     def list_source_objects(self, bucket_name: str) -> Iterator[SourceObject]:
         paginator = self._client.get_paginator("list_objects_v2")
-        listed_objects: list[SourceObject] = []
         for response in paginator.paginate(Bucket=bucket_name):
             response_contents = response.get("Contents", [])
             if not isinstance(response_contents, list):
                 continue
             for raw_object in response_contents:
-                if not isinstance(raw_object, dict):
-                    continue
-                object_key = raw_object.get("Key")
-                object_size = raw_object.get("Size")
-                if isinstance(object_key, str) and isinstance(object_size, int):
-                    listed_objects.append(SourceObject(key=object_key, size=object_size))
+                if isinstance(raw_object, dict):
+                    source_object = self._source_object_from_raw(raw_object)
+                    if source_object is not None:
+                        yield source_object
 
-        for source_object in sorted(listed_objects, key=lambda item: item.key):
-            yield source_object
+    def list_source_page(self, bucket_name: str, continuation_token: str | None = None, page_size: int = 1000) -> tuple[list[SourceObject], str | None]:
+        parameters: dict[str, Any] = {"Bucket": bucket_name, "MaxKeys": page_size}
+        if continuation_token:
+            parameters["ContinuationToken"] = continuation_token
+        response = self._client.list_objects_v2(**parameters)
+        raw_contents = response.get("Contents", [])
+        objects = [
+            parsed
+            for raw in raw_contents
+            if isinstance(raw, dict) and (parsed := self._source_object_from_raw(raw)) is not None
+        ]
+        next_token = response.get("NextContinuationToken") if response.get("IsTruncated") else None
+        return objects, str(next_token) if next_token else None
+
+    def head_object(self, bucket_name: str, object_key: str) -> SourceObject:
+        response = self._client.head_object(Bucket=bucket_name, Key=object_key)
+        etag = response.get("ETag")
+        last_modified = response.get("LastModified")
+        return SourceObject(
+            key=object_key,
+            size=int(response.get("ContentLength", 0)),
+            etag=str(etag) if etag is not None else None,
+            last_modified=last_modified.isoformat() if hasattr(last_modified, "isoformat") else (str(last_modified) if last_modified else None),
+        )
 
     def open_object(self, bucket_name: str, object_key: str) -> BinaryIO:
-        response = self._client.get_object(Bucket=bucket_name, Key=object_key)
+        return self.open_object_conditional(bucket_name, object_key)
+
+    def open_object_conditional(self, bucket_name: str, object_key: str, etag: str | None = None) -> BinaryIO:
+        parameters: dict[str, Any] = {"Bucket": bucket_name, "Key": object_key}
+        if etag:
+            parameters["IfMatch"] = etag
+        response = self._client.get_object(**parameters)
         response_body = response.get("Body")
         if response_body is None:
             raise RuntimeError("R2 returned an empty object body")
@@ -91,21 +111,9 @@ class Boto3R2Client:
             raise
         return True
 
-    def copy_object(
-        self,
-        source_bucket: str,
-        source_key: str,
-        target_bucket: str,
-        target_key: str,
-    ) -> None:
-        self._client.copy_object(
-            Bucket=target_bucket,
-            Key=target_key,
-            CopySource={"Bucket": source_bucket, "Key": source_key},
-        )
+    def copy_object(self, source_bucket: str, source_key: str, target_bucket: str, target_key: str) -> None:
+        self._client.copy_object(Bucket=target_bucket, Key=target_key, CopySource={"Bucket": source_bucket, "Key": source_key})
 
 
 def create_r2_client(connection_settings: ConnectionSettings) -> R2Client:
-    """Create the R2 client used by scanning, preflight, and explicit sync."""
-
     return Boto3R2Client(connection_settings)
