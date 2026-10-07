@@ -10,8 +10,15 @@ import zlib
 
 from botocore.exceptions import BotoCoreError
 
-from .models import FailedObject, ModelReport, ObjectReference, ScanReport, SourceObject
-from .r2_client import ReadOnlyR2Client
+from .models import (
+    FailedObject,
+    ModelReport,
+    ObjectReference,
+    ScanReport,
+    SourceBucketReport,
+    SourceObject,
+)
+from .r2_client import R2Client
 
 MODEL_MEMBER_PATTERN = re.compile(r"^roots/primary/([^/]+)/")
 
@@ -56,7 +63,7 @@ def is_retryable_read_error(error: Exception) -> bool:
 
 
 def scan_object_once(
-    client: ReadOnlyR2Client,
+    client: R2Client,
     source_bucket: str,
     source_object: SourceObject,
 ) -> ObjectScanOutcome:
@@ -77,7 +84,7 @@ def scan_object_once(
 
 
 async def scan_object_with_retries(
-    client: ReadOnlyR2Client,
+    client: R2Client,
     source_bucket: str,
     source_object: SourceObject,
     timeout_seconds: int,
@@ -123,14 +130,13 @@ def create_failed_object(source_object: SourceObject, classification: str) -> Fa
     }
 
 
-def build_scan_report(
-    job_id: str,
+def build_source_bucket_report(
     source_bucket: str,
-    generated_at: str,
     source_objects: list[SourceObject],
     outcomes: dict[str, ObjectScanOutcome],
-) -> ScanReport:
-    """Aggregate every object into a complete, credential-free report."""
+    error: str | None = None,
+) -> SourceBucketReport:
+    """Aggregate one source bucket into a credential-free report section."""
 
     model_objects: dict[str, dict[str, ObjectReference]] = {}
     unmatched_objects: list[ObjectReference] = []
@@ -163,9 +169,8 @@ def build_scan_report(
         }
 
     return {
-        "job_id": job_id,
         "source_bucket": source_bucket,
-        "generated_at": generated_at,
+        "error": error,
         "object_count": len(source_objects),
         "total_bytes": sum(source_object.size for source_object in source_objects),
         "models": models,
@@ -173,4 +178,20 @@ def build_scan_report(
         "non_archive_objects": non_archive_objects,
         "failed_objects": failed_objects,
         "timed_out_objects": timed_out_objects,
+    }
+
+
+def build_scan_report(
+    job_id: str,
+    generated_at: str,
+    source_bucket_reports: list[SourceBucketReport],
+) -> ScanReport:
+    """Aggregate all source bucket reports into one credential-free report."""
+
+    return {
+        "job_id": job_id,
+        "generated_at": generated_at,
+        "source_buckets": source_bucket_reports,
+        "object_count": sum(report["object_count"] for report in source_bucket_reports),
+        "total_bytes": sum(report["total_bytes"] for report in source_bucket_reports),
     }

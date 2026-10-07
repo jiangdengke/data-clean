@@ -134,3 +134,195 @@ Rollback: revert `frontend/src/main.tsx` and `frontend/src/styles.css` to the pr
 - Remote `/home/ubuntu/r2-model-scanner` - rebuilt deployment; server-only `.env` remained outside the repository.
 
 Rollback: on Oracle, restore the previous frontend source files in `/home/ubuntu/r2-model-scanner`, rerun `sudo docker compose --env-file .env up --build -d`, and retain the existing named data volume.
+
+## 2026-10-06 - Task: Fix blank page and complete Cloudflare Nginx routing
+
+### What was done
+
+- Routed `dataclean.lsynb.me` through a dedicated Oracle Nginx virtual host to the loopback-only scanner service.
+- Issued a Let's Encrypt origin certificate, enabled HTTPS redirection, and configured `COOKIE_SECURE=true`.
+- Enabled Uvicorn proxy-header handling so HTTPS origin and same-origin checks work behind Nginx.
+- Blocked hidden-file paths such as `/.env` and `/.git/config` at Nginx.
+- Fixed the blank page root cause: the React application entry had no `createRoot(...).render(...)` call, so production bundling removed the unused UI code.
+- Rebuilt and deployed the React mount fix to Oracle while preserving the existing data volume and loopback-only app port.
+
+### Testing
+
+- `npm --prefix frontend run lint` and `npm --prefix frontend run build` -> passed.
+- Oracle Nginx configuration validation -> `nginx -t` passed; service reload passed.
+- Oracle source HTTPS application route -> HTTP 200.
+- Public `https://dataclean.lsynb.me/` -> HTTP 200 and current React bundle fetched successfully.
+- Deployed JavaScript bundle -> 231 KB and contains `createRoot` and login-screen text; prior broken bundle was about 1.6 KB.
+- Public HTTP hostname -> redirects to HTTPS.
+- Public administrator login -> HTTP 200; session cookie includes `HttpOnly`, `SameSite=Lax`, and `Secure`.
+- Authenticated public connection endpoint -> HTTP 200.
+- Public `/.env` and `/.git/config` paths -> HTTP 404.
+- Container remains bound to `127.0.0.1:8000`; existing named report volume remains attached.
+- No R2 scan or R2 write operation was performed.
+
+### Notes
+
+- `frontend/src/main.tsx` - mounts the React `App` into the HTML root, fixing the blank page.
+- `Dockerfile` - enables Uvicorn proxy-header handling for HTTPS reverse-proxy requests.
+- `docs/deployment.md` - documents the active public HTTPS hostname, Nginx proxy, secure-cookie behavior, and SSH tunnel limitation.
+- `progress.md` - recorded diagnosis, deployment result, verification evidence, and rollback information.
+- Oracle `/etc/nginx/conf.d/dataclean.lsynb.me.conf` - added a dedicated HTTPS proxy site; prior version backed up as `dataclean.lsynb.me.conf.bak-20261006`.
+- Oracle `/home/ubuntu/r2-model-scanner` - rebuilt and running with the existing credential-free data volume.
+
+Rollback: restore the previous Nginx vhost from `/etc/nginx/conf.d/dataclean.lsynb.me.conf.bak-20261006`, run `sudo nginx -t && sudo systemctl reload nginx`, and restore the previous Dockerfile command and frontend entry source before rebuilding. Preserve the named report volume; the R2 service data was not changed.
+
+## 2026-10-06 - Task: Localize and simplify frontend UI
+
+### What was done
+
+- Translated the login, connection, scan, progress, report, status, and known API error messages into Simplified Chinese.
+- Updated the document language, browser title, and theme color for the Chinese interface.
+- Reworked the visual layer toward the selected Apple settings/management direction: neutral system-gray background, white content surfaces, generous whitespace, restrained typography, fine separators, minimal status decoration, and limited system blue emphasis.
+- Kept authentication, in-memory credential handling, scan polling, report rendering, read-only R2 behavior, the React mount fix, and HTTPS proxy support unchanged.
+
+### Testing
+
+- `npm --prefix frontend run lint` -> passed.
+- `npm --prefix frontend run build` -> passed; Vite production bundle generated successfully.
+- `git diff --check` -> passed.
+- Natural-language English copy search in `frontend/src` -> no remaining user-facing English labels found; protocol field names and API/internal identifiers remain intentionally unchanged.
+- Oracle Docker Compose rebuild -> passed; the localized frontend is running in the existing container.
+- Public `https://dataclean.lsynb.me/` -> HTTP 200; served HTML reports `lang="zh-CN"` and title `R2 模型扫描`.
+- Deployed CSS bundle -> contains the Chinese Apple-style system-gray palette and Chinese font stack.
+- No R2 scan or R2 write operation was executed.
+
+### Notes
+
+- `frontend/index.html` - changed metadata to `zh-CN` and `R2 模型扫描`.
+- `frontend/src/main.tsx` - localized visible copy and API error/status presentation.
+- `frontend/src/styles.css` - added the final restrained Chinese Apple-style visual layer and responsive rules.
+- `.trellis/tasks/10-06-localize-apple-frontend/` - recorded the task requirements and frontend quality context.
+
+Rollback: restore the previous frontend files in `/home/ubuntu/r2-model-scanner`, rerun `sudo docker compose --env-file .env up --build -d`, and preserve the existing named report volume. The Nginx configuration and R2 service data were not changed.
+
+## 2026-10-06 - Task: Implement multi-source scan, mapping, and synchronization workflow
+
+### What was done
+
+- Reworked the connection model and dashboard to accept multiple source buckets, test them together, scan them in one background job, and keep each source bucket's model report separate.
+- Added a post-scan mapping step for every `(source bucket, model)` pair, durable mapping storage without credentials, target-bucket preflight, and a clear transition from discovery to execution.
+- Added explicit background synchronization using server-side R2 `CopyObject`; source object keys are preserved, existing target keys are skipped, source objects are never deleted, and individual copy failures are isolated in credential-free sync reports.
+- Added Chinese UI workflow sections for source connection, model discovery, mapping, target checks, sync progress, and sync results. Updated project and deployment documentation to describe the new write boundary.
+
+### Testing
+
+- `./.venv/bin/pytest tests` -> passed, including multi-source report separation, authentication, archive classification, retries, and report aggregation.
+- `npm --prefix frontend run lint` -> passed TypeScript validation.
+- `npm --prefix frontend run build` -> passed Vite production build.
+- `python3 -m compileall backend tests` -> passed.
+- `git diff --check` -> passed.
+- IDE linter diagnostics for edited backend and frontend files -> no diagnostics.
+- No real R2 scan, target preflight, or synchronization was executed during this implementation pass.
+
+### Notes
+
+- `backend/models.py` - added multi-source reports, mappings, sync job, and sync response contracts.
+- `backend/r2_client.py` - added target existence checks and explicit server-side copy support.
+- `backend/scanner.py` - added independent source-bucket report aggregation.
+- `backend/sync.py` - added deduplicated copy-action planning and no-overwrite execution.
+- `backend/storage.py` - added durable mappings and sync reports.
+- `backend/app.py` - added multi-source scanning, mapping endpoints, target preflight, and sync task APIs.
+- `frontend/src/main.tsx` - implemented the complete Chinese scan-to-mapping-to-sync workflow.
+- `frontend/src/styles.css` - added responsive styles for source bucket lists, mapping rows, and preflight results.
+- `tests/` - updated contracts and added multi-source report coverage.
+- `README.md`, `docs/deployment.md`, `.trellis/spec/backend/r2-model-scanner.md` - documented multi-source operation and the explicit copy boundary.
+- `.trellis/tasks/10-06-multi-source-scan-mapping-sync/` - recorded requirements and verification scope.
+- `progress.md` - recorded this implementation and verification evidence.
+
+Rollback: restore the files listed above to their previous versions, remove `backend/sync.py` and the multi-source Trellis task directory, and retain the existing data volume. Do not run the sync endpoint during rollback; no real R2 write was performed in this pass.
+
+## 2026-10-06 - Task: Deploy multi-source workflow to Oracle
+
+### What was done
+
+- Uploaded the multi-source backend, mapping/sync worker, Chinese workflow frontend, Dockerfile, and deployment documentation to the Oracle deployment directory.
+- Rebuilt the ARM64 image successfully and restarted the existing application container without removing the named data volume.
+- Corrected the Compose port binding to `127.0.0.1:8000:8000` so the application remains reachable through Nginx rather than directly exposing port 8000.
+- The public service now serves the multi-source scan, mapping, target preflight, and explicit synchronization workflow.
+
+### Testing
+
+- Oracle `docker compose --env-file .env up --build -d` -> passed; container running.
+- Oracle final container binding -> `127.0.0.1:8000->8000/tcp`.
+- Public `https://dataclean.lsynb.me/` -> HTTP 200.
+- Public page -> Chinese `lang="zh-CN"` and title `R2 模型同步`.
+- Unauthenticated `/api/connection` -> HTTP 401 JSON.
+- Unknown `/api/not-found` -> HTTP 404 JSON.
+- Local final checks -> 15 backend tests passed, frontend lint/build passed, Python compile passed, and `git diff --check` passed.
+- No R2 credentials were entered, no source scan was started, and no target synchronization was executed.
+
+### Notes
+
+- `docker-compose.yml` - restricted the application port to loopback on the deployment host.
+- `progress.md` - recorded the Oracle deployment and final verification evidence.
+- Oracle `/home/ubuntu/r2-model-scanner` - rebuilt and running with the existing named data volume.
+
+Rollback: on Oracle, restore the previous source files and Compose configuration, run `sudo docker compose --env-file .env up --build -d` from `/home/ubuntu/r2-model-scanner`, and keep the named data volume. No R2 data was changed by deployment verification.
+
+## 2026-10-06 - Task: Complete frontend workflow patch and redeploy
+
+### What was done
+
+- Completed the frontend pieces that were missing from the previous implementation pass: current-source-bucket progress display, explicit connection-test success/failure handling, stale report/preflight cleanup after connection changes, and complete-mapping validation before saving or checking targets.
+- Added the missing frontend translation for stale scan reports and preserved the existing source-bucket/model mapping workflow.
+- Uploaded `frontend/src/main.tsx` to the correct Oracle source path, rebuilt the ARM64 image, and restarted the container. An earlier upload accidentally placed a copy at `frontend/main.tsx`; it was not part of the Docker build and was corrected by uploading to `frontend/src/main.tsx`.
+
+### Testing
+
+- `./.venv/bin/pytest tests` -> passed, 15 tests.
+- `npm --prefix frontend run lint` -> passed.
+- `npm --prefix frontend run build` -> passed.
+- `python3 -m compileall backend tests` -> passed.
+- `ADMIN_PASSWORD=test COOKIE_SECURE=false docker compose config --quiet` -> passed.
+- `git diff --check` -> passed.
+- IDE linter diagnostics -> no diagnostics.
+- Oracle build -> passed; new frontend bundle generated as `index-BZnOel3S.js`.
+- Public page -> HTTP 200, title `R2 模型同步`.
+- Public bundle inspection -> contains `当前源桶` and `连接测试已完成`.
+- Unauthenticated `/api/connection` -> HTTP 401 JSON.
+- Oracle container -> running with `127.0.0.1:8000->8000/tcp`.
+- No R2 credentials were entered, and no scan or synchronization was executed.
+
+### Notes
+
+- `frontend/src/main.tsx` - completed the missing progress, connection-result, and stale-state handling.
+- `progress.md` - recorded the corrected frontend deployment and final verification.
+- Oracle `/home/ubuntu/r2-model-scanner/frontend/src/main.tsx` - corrected deployment source path.
+
+Rollback: restore the prior frontend source and rebuild from `/home/ubuntu/r2-model-scanner`; keep the named data volume. Remove the stray remote `frontend/main.tsx` if it is still present; it is not used by the Dockerfile. No R2 data was changed.
+
+## 2026-10-06 - Task: Redesign scan results as source and model cards
+
+### What was done
+
+- Replaced the oversized marketing-style dashboard heading with a compact workspace heading.
+- Redesigned scan results around independent source-bucket cards. Each source bucket now shows its object/model summary and contains separate model cards.
+- Moved the target-bucket input directly into each model card so the relationship is visible as `source bucket card -> model card -> target bucket`.
+- Added expandable object lists inside model cards and kept mapping save/target preflight controls in a compact toolbar below the cards.
+- Kept the existing scan, mapping, target preflight, synchronization, and progress behavior unchanged.
+
+### Testing
+
+- `npm --prefix frontend run lint` -> passed.
+- `npm --prefix frontend run build` -> passed; bundle generated as `index-BZdavQOl.js` and CSS as `index-DwwKzKb5.css`.
+- `git diff --check` -> passed.
+- IDE linter diagnostics for frontend source -> no diagnostics.
+- Oracle ARM64 rebuild -> passed.
+- Public page -> HTTP 200.
+- Public bundle contains `源桶与模型` and `目标桶` card workflow text.
+- Unauthenticated `/api/connection` -> HTTP 401.
+- Oracle container remains bound to `127.0.0.1:8000`.
+- No R2 credentials were entered, and no scan or synchronization was executed.
+
+### Notes
+
+- `frontend/src/main.tsx` - replaced the flat report/mapping sections with nested source-bucket and model cards.
+- `frontend/src/styles.css` - added the card hierarchy, model target fields, expandable object lists, and responsive layout.
+- `progress.md` - recorded the card-based redesign and deployment verification.
+
+Rollback: restore the previous `frontend/src/main.tsx` and `frontend/src/styles.css`, rebuild the Oracle image from `/home/ubuntu/r2-model-scanner`, and retain the named data volume. No R2 data was changed.

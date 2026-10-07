@@ -1,4 +1,4 @@
-"""FastAPI application for authenticated, read-only R2 model scanning."""
+"""FastAPI application for authenticated R2 scanning and explicit sync."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -9,16 +9,40 @@ from typing import cast
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
-from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import AppSettings
-from .models import ConnectionRequest, ConnectionSettings, ConnectionTestResponse, ConnectionView, LoginRequest, ScanReport, SessionResponse, StartScanResponse
+from .models import (
+    BucketModelMapping,
+    ConnectionRequest,
+    ConnectionSettings,
+    ConnectionTestResponse,
+    ConnectionView,
+    LoginRequest,
+    MappingsRequest,
+    MappingsResponse,
+    ScanReferenceRequest,
+    ScanReport,
+    SessionResponse,
+    SourceBucketReport,
+    SourceObject,
+    StartScanResponse,
+    StartSyncResponse,
+    SyncResult,
+    SyncPreflightResponse,
+    TargetBucketCheck,
+)
 from .r2_client import create_r2_client
-from .scanner import build_scan_report, scan_object_with_retries
+from .scanner import (
+    ObjectScanOutcome,
+    build_scan_report,
+    build_source_bucket_report,
+    scan_object_with_retries,
+)
 from .storage import JobRecord, JobStorage, current_timestamp
+from .sync import create_sync_actions, create_sync_failure_result, execute_sync_action
 
 SESSION_COOKIE_NAME = "r2_clean_session"
 
@@ -77,11 +101,52 @@ def get_connection_view(connection_settings: ConnectionSettings | None) -> Conne
 
     if connection_settings is None:
         return ConnectionView(configured=False)
-    return ConnectionView(configured=True, endpoint=connection_settings.endpoint, source_bucket=connection_settings.source_bucket)
+    return ConnectionView(
+        configured=True,
+        endpoint=connection_settings.endpoint,
+        source_buckets=list(connection_settings.source_buckets),
+    )
+
+
+def get_required_mapping_pairs(report: ScanReport) -> set[tuple[str, str]]:
+    """Return every source-bucket/model pair discovered by a scan."""
+
+    return {
+        (bucket_report["source_bucket"], model_name)
+        for bucket_report in report["source_buckets"]
+        for model_name in bucket_report["models"]
+    }
+
+
+def find_missing_mappings(
+    report: ScanReport,
+    mappings: list[BucketModelMapping],
+) -> list[tuple[str, str]]:
+    """Find discovered model pairs that do not have a target bucket."""
+
+    configured_pairs = {
+        (mapping.source_bucket, mapping.model_name)
+        for mapping in mappings
+        if mapping.target_bucket.strip()
+    }
+    return sorted(get_required_mapping_pairs(report) - configured_pairs)
+
+
+def find_duplicate_mapping_pairs(mappings: list[BucketModelMapping]) -> list[tuple[str, str]]:
+    """Find duplicate source-bucket/model mapping keys."""
+
+    seen_pairs: set[tuple[str, str]] = set()
+    duplicate_pairs: set[tuple[str, str]] = set()
+    for mapping in mappings:
+        pair = (mapping.source_bucket, mapping.model_name)
+        if pair in seen_pairs:
+            duplicate_pairs.add(pair)
+        seen_pairs.add(pair)
+    return sorted(duplicate_pairs)
 
 
 async def run_scan_job(application: FastAPI, job_id: str) -> None:
-    """Run one scan and persist status transitions without storing credentials."""
+    """Scan all configured source buckets and persist a credential-free report."""
 
     settings = cast(AppSettings, application.state.settings)
     storage = cast(JobStorage, application.state.job_storage)
@@ -101,28 +166,63 @@ async def run_scan_job(application: FastAPI, job_id: str) -> None:
         existing_job["updated_at"] = current_timestamp()
         storage.save_job(existing_job)
         r2_client = create_r2_client(connection_settings)
-        source_objects = await asyncio.to_thread(lambda: list(r2_client.list_source_objects(connection_settings.source_bucket)))
-        existing_job["progress"] = {"total": len(source_objects), "processed": 0, "failed": 0}
+        bucket_objects: list[tuple[str, list[SourceObject]]] = []
+        bucket_errors: dict[str, str] = {}
+        total_object_count = 0
+
+        for source_bucket in connection_settings.source_buckets:
+            try:
+                source_objects = await asyncio.to_thread(
+                    lambda bucket=source_bucket: list(r2_client.list_source_objects(bucket))
+                )
+            except Exception:
+                source_objects = []
+                bucket_errors[source_bucket] = "Unable to access source bucket"
+            bucket_objects.append((source_bucket, source_objects))
+            total_object_count += len(source_objects)
+
+        existing_job["progress"] = {
+            "total": total_object_count,
+            "processed": 0,
+            "failed": 0,
+        }
         existing_job["updated_at"] = current_timestamp()
         storage.save_job(existing_job)
-        outcomes = {}
-        for source_object in source_objects:
-            outcome = await scan_object_with_retries(r2_client, connection_settings.source_bucket, source_object, settings.object_timeout_seconds, settings.object_retry_count)
-            outcomes[source_object.key] = outcome
-            existing_job["progress"]["processed"] += 1
-            if outcome.classification in {"failed", "archive_corrupt", "timed_out"}:
-                existing_job["progress"]["failed"] += 1
+
+        source_bucket_reports: list[SourceBucketReport] = []
+        for source_bucket, source_objects in bucket_objects:
+            existing_job["current_source_bucket"] = source_bucket
             existing_job["updated_at"] = current_timestamp()
             storage.save_job(existing_job)
-        report: ScanReport = build_scan_report(job_id, connection_settings.source_bucket, current_timestamp(), source_objects, outcomes)
+            outcomes: dict[str, ObjectScanOutcome] = {}
+            for source_object in source_objects:
+                outcome = await scan_object_with_retries(
+                    r2_client,
+                    source_bucket,
+                    source_object,
+                    settings.object_timeout_seconds,
+                    settings.object_retry_count,
+                )
+                outcomes[source_object.key] = outcome
+                existing_job["progress"]["processed"] += 1
+                if outcome.classification in {"failed", "archive_corrupt", "timed_out"}:
+                    existing_job["progress"]["failed"] += 1
+                existing_job["updated_at"] = current_timestamp()
+                storage.save_job(existing_job)
+
+            source_bucket_reports.append(
+                build_source_bucket_report(
+                    source_bucket,
+                    source_objects,
+                    outcomes,
+                    bucket_errors.get(source_bucket),
+                )
+            )
+
+        report = build_scan_report(job_id, current_timestamp(), source_bucket_reports)
         storage.save_report(job_id, report)
         existing_job["status"] = "completed"
         existing_job["report_available"] = True
-        existing_job["updated_at"] = current_timestamp()
-        storage.save_job(existing_job)
-    except (BotoCoreError, ClientError):
-        existing_job["status"] = "failed"
-        existing_job["error"] = "Unable to access the configured source bucket"
         existing_job["updated_at"] = current_timestamp()
         storage.save_job(existing_job)
     except asyncio.CancelledError:
@@ -136,6 +236,67 @@ async def run_scan_job(application: FastAPI, job_id: str) -> None:
         existing_job["error"] = "The scan failed before a report was generated"
         existing_job["updated_at"] = current_timestamp()
         storage.save_job(existing_job)
+
+
+async def run_sync_job(application: FastAPI, sync_job_id: str, scan_job_id: str) -> None:
+    """Copy every mapped source object and persist a safe sync report."""
+
+    storage = cast(JobStorage, application.state.job_storage)
+    connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
+    sync_job = storage.get_job(sync_job_id)
+    scan_report = storage.get_report(scan_job_id)
+    if sync_job is None or scan_report is None or connection_settings is None:
+        return
+
+    try:
+        mappings = storage.get_mappings()
+        actions = create_sync_actions(scan_report, mappings)
+        sync_job["status"] = "running"
+        sync_job["progress"] = {"total": len(actions), "processed": 0, "failed": 0}
+        sync_job["updated_at"] = current_timestamp()
+        storage.save_job(sync_job)
+        client = create_r2_client(connection_settings)
+        results: list[SyncResult] = []
+        for action in actions:
+            try:
+                result = await asyncio.to_thread(execute_sync_action, client, action)
+            except Exception:
+                result = create_sync_failure_result(action)
+            results.append(result)
+            sync_job["progress"]["processed"] += 1
+            if result["status"] == "failed":
+                sync_job["progress"]["failed"] += 1
+            sync_job["updated_at"] = current_timestamp()
+            storage.save_job(sync_job)
+
+        storage.save_sync_report(
+            sync_job_id,
+            {
+                "sync_job_id": sync_job_id,
+                "source_scan_job_id": scan_job_id,
+                "generated_at": current_timestamp(),
+                "total": len(results),
+                "copied": sum(1 for result in results if result["status"] == "copied"),
+                "skipped": sum(1 for result in results if result["status"] == "skipped"),
+                "failed": sum(1 for result in results if result["status"] == "failed"),
+                "results": results,
+            },
+        )
+        sync_job["status"] = "completed"
+        sync_job["report_available"] = True
+        sync_job["updated_at"] = current_timestamp()
+        storage.save_job(sync_job)
+    except asyncio.CancelledError:
+        sync_job["status"] = "interrupted"
+        sync_job["error"] = "The sync was interrupted by a service shutdown"
+        sync_job["updated_at"] = current_timestamp()
+        storage.save_job(sync_job)
+        raise
+    except Exception:
+        sync_job["status"] = "failed"
+        sync_job["error"] = "The sync failed before a report was generated"
+        sync_job["updated_at"] = current_timestamp()
+        storage.save_job(sync_job)
 
 
 @asynccontextmanager
@@ -155,6 +316,8 @@ def create_app(settings: AppSettings) -> FastAPI:
     application.state.session_store = SessionStore(settings.session_max_age_seconds)
     application.state.connection_settings = None
     application.state.active_scan_task = None
+    application.state.active_sync_task = None
+    application.state.sync_start_lock = asyncio.Lock()
 
     @application.post("/api/login", response_model=SessionResponse)
     async def login(login_request: LoginRequest, request: Request, response: Response) -> SessionResponse:
@@ -185,7 +348,17 @@ def create_app(settings: AppSettings) -> FastAPI:
     @application.post("/api/connection", response_model=ConnectionView, dependencies=[Depends(require_authenticated_user)])
     async def set_connection(connection_request: ConnectionRequest, request: Request) -> ConnectionView:
         ensure_same_origin(request)
-        application.state.connection_settings = ConnectionSettings(endpoint=connection_request.endpoint, access_key_id=connection_request.access_key_id, secret_access_key=connection_request.secret_access_key, source_bucket=connection_request.source_bucket)
+        normalized_source_buckets = tuple(
+            dict.fromkeys(bucket.strip() for bucket in connection_request.source_buckets if bucket.strip())
+        )
+        if not normalized_source_buckets:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one source bucket is required")
+        application.state.connection_settings = ConnectionSettings(
+            endpoint=connection_request.endpoint,
+            access_key_id=connection_request.access_key_id,
+            secret_access_key=connection_request.secret_access_key,
+            source_buckets=normalized_source_buckets,
+        )
         return get_connection_view(cast(ConnectionSettings, application.state.connection_settings))
 
     @application.post("/api/connection/test", response_model=ConnectionTestResponse, dependencies=[Depends(require_authenticated_user)])
@@ -194,13 +367,50 @@ def create_app(settings: AppSettings) -> FastAPI:
         connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
         if connection_settings is None:
             return ConnectionTestResponse(success=False, reason="Configure a source connection first")
-        try:
-            await asyncio.to_thread(create_r2_client(connection_settings).test_source_bucket, connection_settings.source_bucket)
-        except (BotoCoreError, ClientError):
-            return ConnectionTestResponse(success=False, reason="Source bucket access failed; verify endpoint, credentials, and bucket name")
-        except Exception:
-            return ConnectionTestResponse(success=False, reason="Source connection test failed")
-        return ConnectionTestResponse(success=True, reason="Source bucket is readable")
+        client = create_r2_client(connection_settings)
+        failed_buckets: list[str] = []
+        for source_bucket in connection_settings.source_buckets:
+            try:
+                await asyncio.to_thread(client.test_source_bucket, source_bucket)
+            except Exception:
+                failed_buckets.append(source_bucket)
+        if failed_buckets:
+            return ConnectionTestResponse(
+                success=False,
+                reason=f"Source bucket access failed: {', '.join(failed_buckets)}",
+            )
+        return ConnectionTestResponse(success=True, reason="All source buckets are readable")
+
+    @application.get("/api/mappings", response_model=MappingsResponse, dependencies=[Depends(require_authenticated_user)])
+    async def get_mappings() -> MappingsResponse:
+        return MappingsResponse(mappings=cast(JobStorage, application.state.job_storage).get_mappings())
+
+    @application.post("/api/mappings", response_model=MappingsResponse, dependencies=[Depends(require_authenticated_user)])
+    async def save_mappings(mapping_request: MappingsRequest, request: Request) -> MappingsResponse:
+        ensure_same_origin(request)
+        storage = cast(JobStorage, application.state.job_storage)
+        normalized_mappings: list[BucketModelMapping] = []
+        for mapping in mapping_request.mappings:
+            source_bucket = mapping.source_bucket.strip()
+            model_name = mapping.model_name.strip()
+            target_bucket = mapping.target_bucket.strip()
+            if not source_bucket or not model_name or not target_bucket:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Source bucket, model name, and target bucket are required",
+                )
+            normalized_mappings.append(
+                BucketModelMapping(
+                    source_bucket=source_bucket,
+                    model_name=model_name,
+                    target_bucket=target_bucket,
+                )
+            )
+        duplicate_pairs = find_duplicate_mapping_pairs(normalized_mappings)
+        if duplicate_pairs:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Duplicate source bucket and model mapping")
+        storage.save_mappings(normalized_mappings)
+        return MappingsResponse(mappings=storage.get_mappings())
 
     @application.post("/api/scans", response_model=StartScanResponse, status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_authenticated_user)])
     async def start_scan(request: Request) -> StartScanResponse:
@@ -212,7 +422,17 @@ def create_app(settings: AppSettings) -> FastAPI:
         if active_scan_task is not None and not active_scan_task.done():
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A scan is already running")
         job_id = str(uuid4())
-        initial_job: JobRecord = {"job_id": job_id, "status": "queued", "source_bucket": connection_settings.source_bucket, "progress": {"total": 0, "processed": 0, "failed": 0}, "report_available": False, "error": None, "updated_at": current_timestamp()}
+        initial_job: JobRecord = {
+            "job_id": job_id,
+            "job_type": "scan",
+            "status": "queued",
+            "source_buckets": list(connection_settings.source_buckets),
+            "current_source_bucket": None,
+            "progress": {"total": 0, "processed": 0, "failed": 0},
+            "report_available": False,
+            "error": None,
+            "updated_at": current_timestamp(),
+        }
         storage = cast(JobStorage, application.state.job_storage)
         storage.save_job(initial_job)
         application.state.active_scan_task = asyncio.create_task(run_scan_job(application, job_id))
@@ -226,12 +446,12 @@ def create_app(settings: AppSettings) -> FastAPI:
 
     @application.get("/api/scans/latest", response_model=None, dependencies=[Depends(require_authenticated_user)])
     async def get_latest_scan_status() -> JobRecord | None:
-        return cast(JobStorage, application.state.job_storage).get_latest_job()
+        return cast(JobStorage, application.state.job_storage).get_latest_job("scan")
 
     @application.get("/api/scans/{job_id}", dependencies=[Depends(require_authenticated_user)])
     async def get_scan_status(job_id: str) -> JobRecord:
         stored_job = cast(JobStorage, application.state.job_storage).get_job(normalize_job_id(job_id))
-        if stored_job is None:
+        if stored_job is None or stored_job.get("job_type", "scan") != "scan":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan job not found")
         return stored_job
 
@@ -240,6 +460,102 @@ def create_app(settings: AppSettings) -> FastAPI:
         stored_report = cast(JobStorage, application.state.job_storage).get_report(normalize_job_id(job_id))
         if stored_report is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan report not found")
+        return stored_report
+
+    @application.post("/api/sync/preflight", response_model=SyncPreflightResponse, dependencies=[Depends(require_authenticated_user)])
+    async def sync_preflight(scan_reference: ScanReferenceRequest, request: Request) -> SyncPreflightResponse:
+        ensure_same_origin(request)
+        connection_settings = cast(ConnectionSettings | None, application.state.connection_settings)
+        if connection_settings is None:
+            return SyncPreflightResponse(success=False, reason="Connection settings are not configured")
+        scan_report = cast(JobStorage, application.state.job_storage).get_report(normalize_job_id(scan_reference.scan_job_id))
+        if scan_report is None:
+            return SyncPreflightResponse(success=False, reason="Scan report not found")
+        report_source_buckets = {
+            bucket_report["source_bucket"]
+            for bucket_report in scan_report["source_buckets"]
+        }
+        configured_source_buckets = set(connection_settings.source_buckets)
+        if report_source_buckets != configured_source_buckets:
+            return SyncPreflightResponse(
+                success=False,
+                reason="The scan report does not match the current source buckets",
+            )
+        if any(bucket_report["error"] for bucket_report in scan_report["source_buckets"]):
+            return SyncPreflightResponse(success=False, reason="The scan did not access every source bucket")
+        mappings = cast(JobStorage, application.state.job_storage).get_mappings()
+        missing_mappings = find_missing_mappings(scan_report, mappings)
+        if missing_mappings:
+            return SyncPreflightResponse(success=False, reason="Some discovered models do not have target buckets")
+        required_pairs = get_required_mapping_pairs(scan_report)
+        target_buckets = sorted(
+            {
+                mapping.target_bucket
+                for mapping in mappings
+                if (mapping.source_bucket, mapping.model_name) in required_pairs
+            }
+        )
+        client = create_r2_client(connection_settings)
+        target_checks: list[TargetBucketCheck] = []
+        for target_bucket in target_buckets:
+            try:
+                await asyncio.to_thread(client.test_source_bucket, target_bucket)
+                target_checks.append(TargetBucketCheck(target_bucket=target_bucket, accessible=True, reason="Target bucket is accessible"))
+            except Exception:
+                target_checks.append(TargetBucketCheck(target_bucket=target_bucket, accessible=False, reason="Target bucket is not accessible"))
+        success = all(check.accessible for check in target_checks)
+        return SyncPreflightResponse(
+            success=success,
+            reason="All target buckets are accessible" if success else "Some target buckets are not accessible",
+            targets=target_checks,
+        )
+
+    @application.post("/api/sync", response_model=StartSyncResponse, status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_authenticated_user)])
+    async def start_sync(scan_reference: ScanReferenceRequest, request: Request) -> StartSyncResponse:
+        ensure_same_origin(request)
+        sync_start_lock = cast(asyncio.Lock, application.state.sync_start_lock)
+        async with sync_start_lock:
+            active_sync_task = cast(asyncio.Task[None] | None, application.state.active_sync_task)
+            if active_sync_task is not None and not active_sync_task.done():
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A sync is already running")
+            preflight_result = await sync_preflight(scan_reference, request)
+            if not preflight_result.success:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=preflight_result.reason)
+            sync_job_id = str(uuid4())
+            sync_job: JobRecord = {
+                "job_id": sync_job_id,
+                "sync_job_id": sync_job_id,
+                "source_scan_job_id": normalize_job_id(scan_reference.scan_job_id),
+                "job_type": "sync",
+                "status": "queued",
+                "source_buckets": [],
+                "progress": {"total": 0, "processed": 0, "failed": 0},
+                "report_available": False,
+                "error": None,
+                "updated_at": current_timestamp(),
+            }
+            cast(JobStorage, application.state.job_storage).save_job(sync_job)
+            application.state.active_sync_task = asyncio.create_task(
+                run_sync_job(application, sync_job_id, sync_job["source_scan_job_id"])
+            )
+            return StartSyncResponse(sync_job_id=sync_job_id, status="queued")
+
+    @application.get("/api/sync/latest", response_model=None, dependencies=[Depends(require_authenticated_user)])
+    async def get_latest_sync_status() -> JobRecord | None:
+        return cast(JobStorage, application.state.job_storage).get_latest_job("sync")
+
+    @application.get("/api/sync/{sync_job_id}", response_model=None, dependencies=[Depends(require_authenticated_user)])
+    async def get_sync_status(sync_job_id: str) -> JobRecord:
+        stored_job = cast(JobStorage, application.state.job_storage).get_job(normalize_job_id(sync_job_id))
+        if stored_job is None or stored_job.get("job_type") != "sync":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync job not found")
+        return stored_job
+
+    @application.get("/api/sync/{sync_job_id}/report", response_model=None, dependencies=[Depends(require_authenticated_user)])
+    async def get_sync_report(sync_job_id: str) -> object:
+        stored_report = cast(JobStorage, application.state.job_storage).get_sync_report(normalize_job_id(sync_job_id))
+        if stored_report is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync report not found")
         return stored_report
 
     frontend_directory = Path(__file__).resolve().parent.parent / "frontend" / "dist"

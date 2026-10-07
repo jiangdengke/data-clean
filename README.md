@@ -1,12 +1,12 @@
-# R2 Model Scanner
+# R2 Model Sync
 
-This project is the initial deployable slice for authenticated, read-only Cloudflare R2 model scanning.
-It lists a known source bucket, reads each source object in deterministic key order, discovers model names
-from `.tar.gz` member paths under `roots/primary/<model-name>/`, and writes credential-free scan status and
-reports to a configurable data directory.
+This project provides an authenticated Cloudflare R2 workflow for scanning multiple source buckets, discovering
+model names from `.tar.gz` member paths under `roots/primary/<model-name>/`, assigning each `(source bucket,
+model)` pair to a manually created target bucket, and synchronizing complete objects with server-side R2 copies.
+Scan status, mappings, and credential-free reports are written to a configurable data directory.
 
-**Sync is not enabled.** This slice does not call write APIs, delete, bucket creation, or
-overwrite operations. Connection tests use read-only bucket access checks.
+Synchronization is explicit and never creates, deletes, or overwrites objects. Existing target keys are skipped.
+Target buckets must be created in advance. R2 credentials remain only in server process memory.
 
 ## Local development
 
@@ -51,9 +51,9 @@ export COOKIE_SECURE=true
 docker compose up --build -d
 ```
 
-The named `r2-model-scanner-data` volume stores credential-free jobs and reports under
+The named `r2-model-scanner-data` volume stores credential-free jobs, mappings, and reports under
 `/var/lib/r2-model-scanner`. Put HTTPS termination in a trusted reverse proxy before exposing this service
 publicly. `COOKIE_SECURE=true` requires HTTPS; use `false` only for local HTTP development.
 
-The container intentionally runs one Uvicorn process because active scan locking is process-local. A restart
-marks queued or running jobs as interrupted, and R2 credentials must be entered again.
+The container intentionally runs one Uvicorn process because active scan and sync locking are process-local.
+A restart marks queued or running jobs as interrupted, and R2 credentials must be entered again.

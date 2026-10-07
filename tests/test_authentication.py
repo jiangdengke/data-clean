@@ -30,7 +30,19 @@ def test_login_sets_http_only_secure_same_site_cookie(tmp_path: Path) -> None:
 def test_connection_response_never_returns_secret_access_key(tmp_path: Path) -> None:
     with create_test_client(tmp_path) as client:
         client.post("/api/login", json={"password": "test-password"})
-        response = client.post("/api/connection", json={"endpoint": "https://example.invalid", "access_key_id": "access-id", "secret_access_key": "secret-value", "source_bucket": "source-bucket"})
+        response = client.post(
+            "/api/connection",
+            json={
+                "endpoint": "https://example.invalid",
+                "access_key_id": "access-id",
+                "secret_access_key": "secret-value",
+                "source_buckets": ["source-bucket"],
+            },
+        )
         assert response.status_code == 200
         assert "secret-value" not in response.text
-        assert response.json() == {"configured": True, "endpoint": "https://example.invalid", "source_bucket": "source-bucket"}
+        assert response.json() == {
+            "configured": True,
+            "endpoint": "https://example.invalid",
+            "source_buckets": ["source-bucket"],
+        }

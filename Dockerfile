@@ -17,4 +17,4 @@ COPY --from=frontend-build /frontend/dist ./frontend/dist
 RUN mkdir -p /var/lib/r2-model-scanner
 VOLUME ["/var/lib/r2-model-scanner"]
 EXPOSE 8000
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

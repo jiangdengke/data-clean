@@ -1,16 +1,17 @@
-"""Read-only R2 client abstractions and the boto3 implementation."""
+"""R2 client abstractions for scanning, preflight, and explicit copies."""
 
 from collections.abc import Iterator
 from typing import BinaryIO, Protocol, cast
 
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 from .models import ConnectionSettings, SourceObject
 
 
-class ReadOnlyR2Client(Protocol):
-    """The source operations required by a scan."""
+class R2Client(Protocol):
+    """The R2 operations required by scanning, preflight, and synchronization."""
 
     def test_source_bucket(self, bucket_name: str) -> None:
         """Validate that a known source bucket can be accessed."""
@@ -21,9 +22,21 @@ class ReadOnlyR2Client(Protocol):
     def open_object(self, bucket_name: str, object_key: str) -> BinaryIO:
         """Open one source object as a streaming binary file."""
 
+    def object_exists(self, bucket_name: str, object_key: str) -> bool:
+        """Check whether a destination object already exists."""
 
-class Boto3ReadOnlyR2Client:
-    """S3-compatible client limited to the application's read-only calls."""
+    def copy_object(
+        self,
+        source_bucket: str,
+        source_key: str,
+        target_bucket: str,
+        target_key: str,
+    ) -> None:
+        """Copy one complete source object to a target bucket."""
+
+
+class Boto3R2Client:
+    """S3-compatible client for source reads and explicit server-side copies."""
 
     def __init__(self, connection_settings: ConnectionSettings) -> None:
         self._client = boto3.client(
@@ -67,8 +80,32 @@ class Boto3ReadOnlyR2Client:
             raise RuntimeError("R2 returned an empty object body")
         return cast(BinaryIO, response_body)
 
+    def object_exists(self, bucket_name: str, object_key: str) -> bool:
+        try:
+            self._client.head_object(Bucket=bucket_name, Key=object_key)
+        except ClientError as error:
+            error_code = str(error.response.get("Error", {}).get("Code", ""))
+            status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if error_code in {"404", "NoSuchKey", "NotFound"} or status_code == 404:
+                return False
+            raise
+        return True
 
-def create_r2_client(connection_settings: ConnectionSettings) -> ReadOnlyR2Client:
-    """Create the only R2 client used by this read-only application slice."""
+    def copy_object(
+        self,
+        source_bucket: str,
+        source_key: str,
+        target_bucket: str,
+        target_key: str,
+    ) -> None:
+        self._client.copy_object(
+            Bucket=target_bucket,
+            Key=target_key,
+            CopySource={"Bucket": source_bucket, "Key": source_key},
+        )
 
-    return Boto3ReadOnlyR2Client(connection_settings)
+
+def create_r2_client(connection_settings: ConnectionSettings) -> R2Client:
+    """Create the R2 client used by scanning, preflight, and explicit sync."""
+
+    return Boto3R2Client(connection_settings)

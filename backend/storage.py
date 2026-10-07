@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 from typing import TypedDict, cast
 
-from .models import ScanReport
+from .models import BucketModelMapping, ScanReport, SyncReport
 
 
 class JobProgress(TypedDict):
@@ -15,10 +15,15 @@ class JobProgress(TypedDict):
     failed: int
 
 
-class JobRecord(TypedDict):
+class JobRecord(TypedDict, total=False):
     job_id: str
+    sync_job_id: str
+    job_type: str
+    source_scan_job_id: str
     status: str
     source_bucket: str
+    source_buckets: list[str]
+    current_source_bucket: str | None
     progress: JobProgress
     report_available: bool
     error: str | None
@@ -62,7 +67,7 @@ class JobStorage:
             raise ValueError("Stored job metadata is not an object")
         return cast(JobRecord, loaded_job)
 
-    def get_latest_job(self) -> JobRecord | None:
+    def get_latest_job(self, job_type: str | None = None) -> JobRecord | None:
         """Return the most recently updated credential-free job record."""
 
         latest_job: JobRecord | None = None
@@ -72,6 +77,8 @@ class JobStorage:
             if not isinstance(loaded_job, dict):
                 continue
             candidate_job = cast(JobRecord, loaded_job)
+            if job_type is not None and candidate_job.get("job_type", "scan") != job_type:
+                continue
             if latest_job is None or candidate_job["updated_at"] > latest_job["updated_at"]:
                 latest_job = candidate_job
         return latest_job
@@ -89,6 +96,41 @@ class JobStorage:
             raise ValueError("Stored scan report is not an object")
         return cast(ScanReport, loaded_report)
 
+    @property
+    def mappings_path(self) -> Path:
+        return self.jobs_directory.parent / "mappings.json"
+
+    def save_mappings(self, mappings: list[BucketModelMapping]) -> None:
+        self._write_json_atomically(
+            self.mappings_path,
+            [mapping.model_dump() for mapping in mappings],
+        )
+
+    def get_mappings(self) -> list[BucketModelMapping]:
+        if not self.mappings_path.is_file():
+            return []
+        with self.mappings_path.open(encoding="utf-8") as mappings_file:
+            loaded_mappings = json.load(mappings_file)
+        if not isinstance(loaded_mappings, list):
+            raise ValueError("Stored mappings are not a list")
+        return [BucketModelMapping.model_validate(item) for item in loaded_mappings]
+
+    def save_sync_report(self, sync_job_id: str, report: SyncReport) -> None:
+        self._write_json_atomically(
+            self.reports_directory / f"sync-{sync_job_id}.json",
+            report,
+        )
+
+    def get_sync_report(self, sync_job_id: str) -> SyncReport | None:
+        report_path = self.reports_directory / f"sync-{sync_job_id}.json"
+        if not report_path.is_file():
+            return None
+        with report_path.open(encoding="utf-8") as report_file:
+            loaded_report = json.load(report_file)
+        if not isinstance(loaded_report, dict):
+            raise ValueError("Stored sync report is not an object")
+        return cast(SyncReport, loaded_report)
+
     def mark_active_jobs_interrupted(self) -> None:
         for job_path in self.jobs_directory.glob("*.json"):
             with job_path.open(encoding="utf-8") as job_file:
@@ -98,6 +140,10 @@ class JobStorage:
             if loaded_job.get("status") not in {"queued", "running"}:
                 continue
             loaded_job["status"] = "interrupted"
-            loaded_job["error"] = "The scan was interrupted by a service restart"
+            loaded_job["error"] = (
+                "The sync was interrupted by a service restart"
+                if loaded_job.get("job_type", "scan") == "sync"
+                else "The scan was interrupted by a service restart"
+            )
             loaded_job["updated_at"] = current_timestamp()
             self._write_json_atomically(job_path, loaded_job)

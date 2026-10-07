@@ -1,21 +1,25 @@
-# R2 Model Scanner Contracts
+# R2 Model Sync Contracts
 
-## Scenario: Read-only R2 model scanning
+## Scenario: Multi-source R2 model scanning and explicit synchronization
 
 ### 1. Scope / Trigger
 
 - Trigger: Any change to the FastAPI application, R2 client, scanner, background jobs, or report storage.
-- Scope: The application reads a configured source bucket and discovers model names from `.tar.gz` archive member paths.
-- Forbidden in the read-only slice: `PutObject`, `CopyObject`, multipart writes, deletes, bucket creation, and temporary test uploads.
+- Scope: The application reads configured source buckets, discovers model names from `.tar.gz` archive member paths, and performs explicit server-side copies only after mapping and target preflight.
+- Synchronization boundary: `CopyObject` is allowed only in the background sync task after administrator action. `PutObject`, multipart writes, deletes, bucket creation, and overwrite operations remain forbidden.
 
 ### 2. Signatures
 
 - `POST /api/login` accepts `{ "password": string }` and establishes an opaque server-side session cookie.
-- `POST /api/connection` accepts `{ "endpoint": string, "access_key_id": string, "secret_access_key": string, "source_bucket": string }`.
-- `POST /api/connection/test` performs read-only source bucket validation.
+- `POST /api/connection` accepts `{ "endpoint": string, "access_key_id": string, "secret_access_key": string, "source_buckets": string[] }`.
+- `POST /api/connection/test` validates every configured source bucket with read-only access checks.
 - `POST /api/scans` returns HTTP 202 with `{ "job_id": string, "status": "queued" }`.
 - `GET /api/scans/{job_id}` returns credential-free job status and progress.
 - `GET /api/scans/{job_id}/report` returns the credential-free scan report after completion.
+- `GET/POST /api/mappings` reads and persists `(source_bucket, model_name, target_bucket)` mappings without credentials.
+- `POST /api/sync/preflight` validates complete mappings and target bucket access.
+- `POST /api/sync` starts an authenticated background server-side copy task.
+- `GET /api/sync/{sync_job_id}` and `/report` return sync status and credential-free results.
 - `extract_model_names(member_paths)` returns sorted unique names matching `roots/primary/<model-name>/...`.
 
 ### 3. Contracts
@@ -24,7 +28,7 @@
 
 - All protected endpoints require the server-side session cookie.
 - Connection secrets are accepted only by the server and are never returned in a response, report, durable job record, or log.
-- A scan report includes source object count and total bytes, model object lists and totals, unmatched objects, non-archive objects, failed objects, and timed-out objects.
+- A scan report includes independent source-bucket sections with object count and total bytes, model object lists and totals, unmatched objects, non-archive objects, failed objects, timed-out objects, and bucket access errors.
 - Object references contain only `key` and `size`.
 - One source object may appear under multiple models, but at most once per individual model report.
 
@@ -39,7 +43,7 @@
 - Each object scan has a 120-second timeout.
 - Network/read errors may be retried up to two times after the first attempt.
 - Archive corruption is classified without retry.
-- One process-local scan task may run at a time.
+- One process-local scan task and one process-local sync task may run at a time.
 
 ### 4. Validation & Error Matrix
 
@@ -64,7 +68,7 @@
 - Good: An archive containing both `model-a` and `model-b` is included once in each model report.
 - Base: A valid non-archive object is listed in `non_archive_objects` and does not fail the complete scan.
 - Bad: A response, report, or durable JSON record contains a secret access key, password, or raw provider error.
-- Bad: A connection test uploads a temporary object or a read-only scan calls any object-write API.
+- Bad: A scan or preflight calls an object-write API; only the explicit sync worker may call `CopyObject`.
 
 ### 6. Tests Required
 
@@ -94,5 +98,4 @@ return await asyncio.to_thread(
 )
 ```
 
-Connection testing performs only a read-only bucket check. Actual synchronization requires a later, separately approved implementation phase.
-
+Connection testing and target preflight perform only read-only bucket checks. Synchronization starts only after the administrator saves complete mappings, passes target preflight, and explicitly clicks the sync action; the worker uses server-side `CopyObject` and records safe per-object results.
