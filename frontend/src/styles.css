@@ -1472,108 +1472,72 @@ progress::-moz-progress-bar {
   font-size: 0.88rem;
 }
 
+.dashboard-span-full {
+  grid-column: 1 / -1;
+}
+
+.connection-card .card-description {
+  max-width: 72ch;
+}
+
 .connection-profiles {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.75rem;
 }
 
-/* Keep the connection section scannable: details are edited only after opening a bucket tile. */
-.connection-profile {
+.connection-profile-card,
+.connection-add-card {
+  width: 100%;
   min-width: 0;
-  overflow: hidden;
+  min-height: 148px;
   border: 1px solid #e5e5e7;
-  border-radius: 18px;
+  border-radius: 16px;
+  padding: 1rem;
+  color: var(--ink);
   background: #ffffff;
-  transition: border-color 160ms ease, box-shadow 160ms ease;
+  box-shadow: none;
+  text-align: left;
 }
 
-.connection-profile[open] {
-  border-color: #b9c9eb;
-  box-shadow: 0 8px 24px rgba(0, 113, 227, 0.08);
+.connection-profile-card:hover:not(:disabled) {
+  border-color: #b8c7dc;
+  color: var(--ink);
+  background: #fbfbfd;
+  box-shadow: none;
 }
 
-.connection-profile-summary {
+.connection-profile-card-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 1rem;
-  min-height: 142px;
-  padding: 1rem;
-  cursor: pointer;
-  list-style: none;
+  gap: 0.75rem;
 }
 
-.connection-profile-summary::-webkit-details-marker {
-  display: none;
-}
-
-.connection-profile-summary:hover {
-  background: #fbfbfd;
-}
-
-.connection-profile-summary:focus-visible {
-  outline: 3px solid rgba(0, 113, 227, 0.2);
-  outline-offset: -3px;
-}
-
-.connection-profile-summary-main {
+.connection-profile-card-copy {
   display: grid;
   min-width: 0;
-  gap: 0.28rem;
+  gap: 0.2rem;
 }
 
 .connection-profile-kicker,
-.connection-profile-stats small {
+.connection-profile-meta small {
   color: var(--muted);
-  font-size: 0.73rem;
+  font-size: 0.72rem;
 }
 
 .connection-profile-kicker {
-  font-weight: 600;
+  font-weight: 550;
 }
 
 .connection-profile-name {
-  overflow-wrap: anywhere;
-  color: var(--ink);
-  font-size: 1.05rem;
-  font-weight: 650;
-  letter-spacing: -0.025em;
-}
-
-.connection-profile-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-top: 0.7rem;
-}
-
-.connection-profile-stats span {
-  display: grid;
-  gap: 0.05rem;
-  min-width: 0;
-}
-
-.connection-profile-stats strong {
   overflow: hidden;
   color: var(--ink);
-  font-size: 0.77rem;
-  font-weight: 600;
+  font-size: 1.02rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.connection-profile-summary-side {
-  display: grid;
-  flex: 0 0 auto;
-  justify-items: end;
-  gap: 0.75rem;
-}
-
-.connection-profile-edit {
-  color: var(--blue);
-  font-size: 0.76rem;
-  font-weight: 600;
 }
 
 .bucket-status.is-pending {
@@ -1581,44 +1545,161 @@ progress::-moz-progress-bar {
   background: var(--amber-soft);
 }
 
-.connection-profile-editor {
+.connection-profile-meta {
   display: grid;
-  gap: 1rem;
-  padding: 1rem;
-  border-top: 1px solid #e5e5e7;
-  background: #fbfbfd;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+  margin-top: 1rem;
 }
 
-.connection-profile-editor-header {
+.connection-profile-meta > span {
+  display: grid;
+  min-width: 0;
+  gap: 0.05rem;
+}
+
+.connection-profile-meta strong {
+  overflow: hidden;
+  color: #424245;
+  font-size: 0.76rem;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-profile-edit {
+  display: inline-block;
+  margin-top: 0.8rem;
+  color: var(--blue);
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.connection-add-card {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 0.2rem;
+  border-color: #afc8e8;
+  border-style: dashed;
+  color: var(--blue);
+  background: #f7faff;
+  text-align: center;
+}
+
+.connection-add-card:hover:not(:disabled) {
+  border-color: var(--blue);
+  color: var(--blue-dark);
+  background: var(--blue-soft);
+  box-shadow: none;
+}
+
+.connection-add-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 50%;
+  color: #ffffff;
+  background: var(--blue);
+  font-size: 1.25rem;
+  line-height: 1;
+}
+
+.connection-add-card > span:nth-child(2) {
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.connection-add-card small {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.connection-actions-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.connection-actions-form {
+  margin-top: auto;
+}
+
+.connection-actions-form .button-row {
+  align-items: center;
+}
+
+.connection-actions-form button,
+.connection-dialog-actions button,
+.connection-remove-zone button {
+  min-height: 44px;
+}
+
+.connection-actions-form .primary-button,
+.connection-dialog-actions .primary-button {
+  width: auto;
+}
+
+.connection-dialog {
+  width: min(calc(100% - 2rem), 620px);
+  max-height: min(88vh, 760px);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 22px;
+  color: var(--ink);
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(29, 29, 31, 0.22);
+}
+
+.connection-dialog::backdrop {
+  background: rgba(29, 29, 31, 0.42);
+}
+
+.connection-dialog-surface {
+  max-height: min(88vh, 760px);
+  overflow-y: auto;
+}
+
+.connection-dialog-form {
+  display: grid;
+}
+
+.connection-dialog-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
+  padding: 1.4rem 1.5rem 1.15rem;
+  border-bottom: 1px solid #e5e5e7;
 }
 
-.connection-profile-editor-header h3 {
-  margin: 0.25rem 0 0;
+.connection-dialog-header h2 {
+  margin-top: 0.35rem;
   overflow-wrap: anywhere;
-  font-size: 1rem;
 }
 
-.connection-profile-editor-note {
-  max-width: 18ch;
+.connection-dialog-readiness {
+  display: grid;
+  flex: 0 0 auto;
+  justify-items: end;
+  gap: 0.3rem;
   color: var(--muted);
   font-size: 0.72rem;
-  text-align: right;
 }
 
-.connection-profile-fields {
+.connection-dialog-error {
+  margin: 1rem 1.5rem 0;
+}
+
+.connection-dialog-fields {
   display: grid;
-  gap: 0.8rem;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
 }
 
-.connection-profile .form-field {
-  gap: 0.45rem;
-}
-
-.connection-profile .form-field small {
+.connection-dialog-fields .form-field small {
   display: block;
   color: var(--muted);
   font-size: 0.73rem;
@@ -1626,27 +1707,65 @@ progress::-moz-progress-bar {
   line-height: 1.45;
 }
 
-.connection-profile-remove {
-  justify-self: start;
+.connection-remove-zone {
+  padding: 0 1.5rem 1.25rem;
+}
+
+.connection-profile-remove,
+.danger-button {
   color: var(--red);
   border-color: transparent;
   background: var(--red-soft);
 }
 
-.connection-profile-remove:hover:not(:disabled) {
+.connection-profile-remove:hover:not(:disabled),
+.danger-button:hover:not(:disabled) {
   color: var(--red);
   border-color: transparent;
   background: #ffe1e1;
   box-shadow: none;
 }
 
-.connection-form > .text-button {
-  justify-self: start;
-  margin-top: -0.4rem;
+.connection-remove-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem;
+  border: 1px solid #f0caca;
+  border-radius: 14px;
+  background: #fff8f8;
 }
 
-.connection-add-button {
-  min-height: 44px;
+.connection-remove-confirm p {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0;
+  color: var(--red);
+  font-size: 0.8rem;
+}
+
+.connection-remove-confirm p span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 400;
+}
+
+.connection-remove-confirm > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.45rem;
+}
+
+.connection-dialog-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  padding: 1rem 1.5rem;
+  border-top: 1px solid #e5e5e7;
+  background: rgba(255, 255, 255, 0.96);
 }
 
 .incremental-card {
@@ -1744,8 +1863,11 @@ progress::-moz-progress-bar {
   text-align: center;
 }
 
-.incremental-card .button-row .text-button {
+.incremental-card .button-row button {
   min-height: 44px;
+}
+
+.incremental-card .button-row .text-button {
   margin-top: 0;
 }
 
@@ -1796,23 +1918,68 @@ progress::-moz-progress-bar {
     grid-template-columns: 1fr;
   }
 
-  .connection-profile-summary {
-    min-height: 132px;
-    padding: 0.95rem;
+  .connection-profile-card,
+  .connection-add-card {
+    min-height: 136px;
   }
 
-  .connection-profile-editor {
-    padding: 0.95rem;
+  .connection-actions-form .button-row {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
-  .connection-profile-editor-header {
+  .connection-actions-form .primary-button,
+  .connection-actions-form .secondary-button {
+    width: 100%;
+  }
+
+  .connection-dialog {
+    width: min(calc(100% - 1rem), 620px);
+    max-height: calc(100vh - 1rem);
+    border-radius: 18px;
+  }
+
+  .connection-dialog-surface {
+    max-height: calc(100vh - 1rem);
+  }
+
+  .connection-dialog-header {
+    align-items: flex-start;
     flex-direction: column;
-    gap: 0.45rem;
+    padding: 1.2rem 1.1rem 1rem;
   }
 
-  .connection-profile-editor-note {
-    max-width: none;
-    text-align: left;
+  .connection-dialog-readiness {
+    justify-items: start;
+  }
+
+  .connection-dialog-fields {
+    padding: 1.1rem;
+  }
+
+  .connection-remove-zone {
+    padding: 0 1.1rem 1.1rem;
+  }
+
+  .connection-remove-confirm {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .connection-remove-confirm > div {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .connection-dialog-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 0.9rem 1.1rem;
+  }
+
+  .connection-dialog-actions .primary-button,
+  .connection-dialog-actions .secondary-button {
+    width: 100%;
   }
 
   .incremental-card .card-header {

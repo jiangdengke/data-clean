@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { FormEvent } from "react";
 import "./styles.css";
@@ -292,75 +292,208 @@ function ReportView({
 
 type ConnectionProfilesProps = {
   connections: ConnectionProfile[];
-  canTest: boolean;
-  onUpdate: (index: number, field: keyof ConnectionProfile, value: string) => void;
-  onAdd: () => void;
+  onApply: (index: number | null, profile: ConnectionProfile) => void;
   onRemove: (index: number) => void;
-  onSave: (event: FormEvent<HTMLFormElement>) => void | Promise<void>;
-  onTest: () => void | Promise<void>;
 };
 
-function ConnectionProfiles({ connections, canTest, onUpdate, onAdd, onRemove, onSave, onTest }: ConnectionProfilesProps): React.JSX.Element {
+type ConnectionDraft = { index: number | null; profile: ConnectionProfile };
+
+function ConnectionProfiles({ connections, onApply, onRemove }: ConnectionProfilesProps): React.JSX.Element {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const dialogId = useId();
+  const bucketNameInputRef = useRef<HTMLInputElement>(null);
+  const addButtonRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef<HTMLButtonElement | null>(null);
+  const [draft, setDraft] = useState<ConnectionDraft | null>(null);
+  const [removePending, setRemovePending] = useState(false);
+  const [formError, setFormError] = useState("");
+
+  useEffect(() => {
+    if (!draft || dialogRef.current?.open) return undefined;
+    dialogRef.current?.showModal();
+    const frame = window.requestAnimationFrame(() => bucketNameInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [draft]);
+
+  function openEditor(index: number | null, profile: ConnectionProfile, trigger: HTMLButtonElement): void {
+    returnFocusRef.current = trigger;
+    setRemovePending(false);
+    setFormError("");
+    setDraft({ index, profile: { ...profile } });
+  }
+
+  function closeEditor(): void {
+    dialogRef.current?.close("cancel");
+  }
+
+  function handleDialogClose(): void {
+    setDraft(null);
+    setRemovePending(false);
+    const returnTarget = returnFocusRef.current;
+    window.requestAnimationFrame(() => {
+      if (returnTarget?.isConnected) returnTarget.focus();
+      else addButtonRef.current?.focus();
+    });
+  }
+
+  function updateDraft(field: keyof ConnectionProfile, value: string): void {
+    setFormError("");
+    setDraft((current) => current ? { ...current, profile: { ...current.profile, [field]: value } } : current);
+  }
+
+  function applyDraft(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    if (!draft) return;
+    const sourceBucket = draft.profile.source_bucket.trim();
+    const endpoint = draft.profile.endpoint.trim();
+    const credentialRef = draft.profile.credential_ref.trim();
+    if (!sourceBucket) {
+      setFormError("源桶名称不能为空。");
+      return;
+    }
+    if (!endpoint) {
+      setFormError("R2 endpoint 不能为空。");
+      return;
+    }
+    if (!credentialRef || !/^[A-Za-z0-9_-]+$/.test(credentialRef)) {
+      setFormError("Secret 配置引用只能包含字母、数字、下划线或连字符。");
+      return;
+    }
+    if (connections.some((profile, index) => index !== draft.index && profile.source_bucket.trim() === sourceBucket)) {
+      setFormError("源桶名称不能重复。");
+      return;
+    }
+    onApply(draft.index, {
+      source_bucket: sourceBucket,
+      endpoint,
+      credential_ref: credentialRef,
+    });
+    dialogRef.current?.close("apply");
+  }
+
+  function confirmRemove(): void {
+    if (draft?.index === null || draft?.index === undefined) return;
+    onRemove(draft.index);
+    dialogRef.current?.close("remove");
+  }
+
+  const draftName = draft?.profile.source_bucket.trim() || (draft?.index === null ? "新源桶" : "未命名源桶");
+  const draftReady = Boolean(draft?.profile.source_bucket.trim() && draft.profile.endpoint.trim() && draft.profile.credential_ref.trim());
+
   return (
-    <form className="connection-form" onSubmit={(event) => void onSave(event)}>
+    <>
       <div className="connection-profiles" aria-label="源桶连接列表">
         {connections.map((profile, index) => {
           const bucketName = profile.source_bucket.trim() || `未命名源桶 ${index + 1}`;
           const endpointReady = Boolean(profile.endpoint.trim());
           const credentialReady = Boolean(profile.credential_ref.trim());
           const isConfigured = Boolean(profile.source_bucket.trim() && endpointReady && credentialReady);
-          const detailId = `connection-editor-${index}`;
+          const endpointSummary = profile.endpoint.trim().replace(/^https?:\/\//, "") || "未设置";
 
           return (
-            <details className="connection-profile" key={`connection-${index}`}>
-              <summary className="connection-profile-summary" aria-label={`打开 ${bucketName} 的连接详情`} aria-controls={detailId}>
-                <span className="connection-profile-summary-main">
-                  <span className="connection-profile-kicker">源桶连接 {index + 1}</span>
+            <button
+              className="connection-profile-card"
+              type="button"
+              key={`connection-${index}`}
+              aria-haspopup="dialog"
+              aria-label={`编辑 ${bucketName} 源桶连接`}
+              onClick={(event) => openEditor(index, profile, event.currentTarget)}
+            >
+              <span className="connection-profile-card-header">
+                <span className="connection-profile-card-copy">
+                  <span className="connection-profile-kicker">源桶 {index + 1}</span>
                   <span className="connection-profile-name">{bucketName}</span>
-                  <span className="connection-profile-stats" aria-label="连接摘要">
-                    <span><strong>{endpointReady ? "已设置" : "待填写"}</strong><small>R2 endpoint</small></span>
-                    <span><strong>{credentialReady ? profile.credential_ref : "未设置"}</strong><small>Secret ref</small></span>
-                  </span>
                 </span>
-                <span className="connection-profile-summary-side">
-                  <span className={`bucket-status ${isConfigured ? "is-ready" : "is-pending"}`}>{isConfigured ? "已配置" : "待配置"}</span>
-                  <span className="connection-profile-edit" aria-hidden="true">编辑</span>
-                </span>
-              </summary>
-              <div className="connection-profile-editor" id={detailId}>
-                <div className="connection-profile-editor-header">
-                  <div><p className="section-kicker">连接详情</p><h3>编辑 {bucketName}</h3></div>
-                  <span className="connection-profile-editor-note">仅保存部署 Secret 引用</span>
-                </div>
-                <div className="connection-profile-fields">
-                  <label className="form-field" htmlFor={`source-bucket-${index}`}>
-                    <span>源存储桶</span>
-                    <input id={`source-bucket-${index}`} value={profile.source_bucket} onChange={(event) => onUpdate(index, "source_bucket", event.target.value)} placeholder="例如：source-a" autoComplete="off" required />
-                  </label>
-                  <label className="form-field" htmlFor={`r2-endpoint-${index}`}>
-                    <span>R2 endpoint</span>
-                    <input id={`r2-endpoint-${index}`} type="url" value={profile.endpoint} onChange={(event) => onUpdate(index, "endpoint", event.target.value)} placeholder="https://<account-id>.r2.cloudflarestorage.com" autoComplete="url" required />
-                  </label>
-                  <label className="form-field" htmlFor={`credential-ref-${index}`}>
-                    <span>Secret 配置引用</span>
-                    <input id={`credential-ref-${index}`} value={profile.credential_ref} onChange={(event) => onUpdate(index, "credential_ref", event.target.value)} placeholder="default" pattern="[A-Za-z0-9_-]+" autoComplete="off" required />
-                    <small>例如 default 或 team_a；真实密钥由部署环境注入，不会在此页面回显。</small>
-                  </label>
-                </div>
-                <button className="connection-profile-remove" type="button" onClick={() => onRemove(index)} disabled={connections.length <= 1} aria-label={`移除 ${bucketName} 源桶连接`} title={connections.length <= 1 ? "至少保留一个源桶连接" : `移除 ${bucketName}`}>
-                  {connections.length <= 1 ? "至少保留一个源桶" : "移除源桶"}
-                </button>
-              </div>
-            </details>
+                <span className={`bucket-status ${isConfigured ? "is-ready" : "is-pending"}`}>{isConfigured ? "已就绪" : "待完善"}</span>
+              </span>
+              <span className="connection-profile-meta" aria-label="连接摘要">
+                <span><small>Endpoint</small><strong title={profile.endpoint}>{endpointSummary}</strong></span>
+                <span><small>Secret 引用</small><strong>{credentialReady ? profile.credential_ref : "未设置"}</strong></span>
+              </span>
+              <span className="connection-profile-edit" aria-hidden="true">查看与编辑</span>
+            </button>
           );
         })}
+        <button
+          ref={addButtonRef}
+          className="connection-add-card"
+          type="button"
+          aria-haspopup="dialog"
+          onClick={(event) => openEditor(null, { source_bucket: "", endpoint: "", credential_ref: "default" }, event.currentTarget)}
+        >
+          <span className="connection-add-mark" aria-hidden="true">+</span>
+          <span>添加源桶</span>
+          <small>创建新的连接配置</small>
+        </button>
       </div>
-      <button className="text-button connection-add-button" type="button" onClick={onAdd} aria-label="添加源桶连接">+ 添加源桶</button>
-      <div className="button-row">
-        <button className="primary-button" type="submit" aria-label="保存源桶连接配置">保存连接</button>
-        <button className="secondary-button" type="button" onClick={() => void onTest()} disabled={!canTest} aria-label="测试源桶连接">测试连接</button>
-      </div>
-    </form>
+
+      <dialog
+        ref={dialogRef}
+        className="connection-dialog"
+        aria-labelledby={draft ? `${dialogId}-title` : undefined}
+        onCancel={() => setRemovePending(false)}
+        onClose={handleDialogClose}
+        onClick={(event) => { if (event.target === event.currentTarget) closeEditor(); }}
+      >
+        {draft && (
+          <div className="connection-dialog-surface">
+            <form className="connection-dialog-form" onSubmit={applyDraft}>
+              <header className="connection-dialog-header">
+                <div>
+                  <p className="section-kicker">源桶连接</p>
+                  <h2 id={`${dialogId}-title`}>{draft.index === null ? "添加源桶" : `编辑 ${draftName}`}</h2>
+                </div>
+                <div className="connection-dialog-readiness" aria-live="polite">
+                  <span className={`bucket-status ${draftReady ? "is-ready" : "is-pending"}`}>{draftReady ? "已就绪" : "待完善"}</span>
+                  <span>{draftReady ? "连接字段已填写" : "请补全连接字段"}</span>
+                </div>
+              </header>
+
+              {formError && <p className="feedback feedback-error connection-dialog-error" role="alert">{formError}</p>}
+
+              <div className="connection-dialog-fields">
+                <label className="form-field" htmlFor={`${dialogId}-source-bucket`}>
+                  <span>源桶名称</span>
+                  <input ref={bucketNameInputRef} id={`${dialogId}-source-bucket`} value={draft.profile.source_bucket} onChange={(event) => updateDraft("source_bucket", event.target.value)} placeholder="例如：source-a" autoComplete="off" required />
+                </label>
+                <label className="form-field" htmlFor={`${dialogId}-r2-endpoint`}>
+                  <span>R2 endpoint</span>
+                  <input id={`${dialogId}-r2-endpoint`} type="url" value={draft.profile.endpoint} onChange={(event) => updateDraft("endpoint", event.target.value)} placeholder="https://<account-id>.r2.cloudflarestorage.com" autoComplete="url" required />
+                </label>
+                <label className="form-field" htmlFor={`${dialogId}-credential-ref`}>
+                  <span>Secret 配置引用</span>
+                  <input id={`${dialogId}-credential-ref`} value={draft.profile.credential_ref} onChange={(event) => updateDraft("credential_ref", event.target.value)} placeholder="default" pattern="[A-Za-z0-9_-]+" autoComplete="off" required />
+                  <small>仅填写部署 Secret 的引用名称；真实凭据不会在此显示。</small>
+                </label>
+              </div>
+
+              {draft.index !== null && (
+                <div className="connection-remove-zone">
+                  {!removePending ? (
+                    <button className="connection-profile-remove" type="button" onClick={() => setRemovePending(true)} disabled={connections.length <= 1}>
+                      {connections.length <= 1 ? "至少保留一个源桶" : "移除源桶"}
+                    </button>
+                  ) : (
+                    <div className="connection-remove-confirm" role="group" aria-label={`确认移除 ${draftName}`}>
+                      <p><strong>确认移除此源桶？</strong><span>移除后仍需点击“保存连接”才会持久化。</span></p>
+                      <div>
+                        <button className="secondary-button" type="button" onClick={() => setRemovePending(false)}>保留</button>
+                        <button className="danger-button" type="button" onClick={confirmRemove}>确认移除</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <footer className="connection-dialog-actions">
+                <button className="secondary-button" type="button" onClick={closeEditor}>取消</button>
+                <button className="primary-button" type="submit">应用</button>
+              </footer>
+            </form>
+          </div>
+        )}
+      </dialog>
+    </>
   );
 }
 
@@ -405,7 +538,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
     void callApi<SyncReport>(`/api/sync/${syncJob.sync_job_id ?? syncJob.job_id}/report`).then(setSyncReport).catch((error: unknown) => setErrorMessage(localizedError(error, "无法读取同步报告。")));
   }, [syncJob?.job_id, syncJob?.report_available]);
 
-  function updateConnection(index: number, field: keyof ConnectionProfile, value: string): void { setConnections((current) => current.map((profile, profileIndex) => profileIndex === index ? { ...profile, [field]: value } : profile)); }
+  function applyConnection(index: number | null, profile: ConnectionProfile): void { setConnections((current) => index === null ? [...current, profile] : current.map((currentProfile, profileIndex) => profileIndex === index ? profile : currentProfile)); }
   function updateMapping(sourceBucket: string, modelName: string, targetBucket: string): void { setMappings((currentMappings) => currentMappings.map((mapping) => mapping.source_bucket === sourceBucket && mapping.model_name === modelName ? { ...mapping, target_bucket: targetBucket } : mapping)); setPreflight(null); }
 
   async function saveConnection(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -435,11 +568,25 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
       {errorMessage && <p className="feedback feedback-error page-feedback" role="alert">{errorMessage}</p>}
       {message && <p className="feedback feedback-success page-feedback" role="status">{message}</p>}
       <div className="dashboard-grid">
-        <section className="card workflow-card"><div className="card-header"><div><p className="section-kicker">01 / 连接</p><h2>配置源存储桶</h2></div><span className={`connection-state ${connection.configured ? "is-configured" : ""}`}>{connection.configured ? "已配置" : "未配置"}</span></div><p className="card-description">先选择一个源桶卡片，再在详情面板中编辑连接信息。访问密钥只由部署环境注入，不会在浏览器、SQLite、报告或日志中出现。</p><ConnectionProfiles connections={connections} canTest={connection.configured} onUpdate={updateConnection} onAdd={() => setConnections((current) => [...current, { source_bucket: "", endpoint: "", credential_ref: "default" }])} onRemove={(index) => setConnections((current) => current.filter((_, profileIndex) => profileIndex !== index))} onSave={saveConnection} onTest={testConnection} /></section>
+        <section className="card workflow-card connection-card dashboard-span-full" aria-labelledby="source-connections-title">
+          <div className="card-header"><div><p className="section-kicker">01 / 连接</p><h2 id="source-connections-title">源桶连接</h2></div><span className={`connection-state ${connection.configured ? "is-configured" : ""}`}>{connection.configured ? "已保存" : "未保存"}</span></div>
+          <p className="card-description">选择源桶卡片查看连接详情。页面只显示 Secret 引用，真实凭据始终由部署环境注入。</p>
+          <ConnectionProfiles connections={connections} onApply={applyConnection} onRemove={(index) => setConnections((current) => current.filter((_, profileIndex) => profileIndex !== index))} />
+        </section>
+        <section className="card workflow-card connection-actions-card" aria-labelledby="connection-actions-title">
+          <div className="card-header"><div><p className="section-kicker">配置提交</p><h2 id="connection-actions-title">连接操作</h2></div></div>
+          <p className="card-description">“应用”只更新当前页面；保存后才会写入配置。测试始终使用最近一次已保存的连接。</p>
+          <form className="connection-actions-form" onSubmit={(event) => void saveConnection(event)}>
+            <div className="button-row">
+              <button className="primary-button" type="submit" aria-label="保存源桶连接配置">保存连接</button>
+              <button className="secondary-button" type="button" onClick={() => void testConnection()} disabled={!connection.configured} aria-label="测试已保存的源桶连接">测试连接</button>
+            </div>
+          </form>
+        </section>
         <section className="card workflow-card"><div className="card-header"><div><p className="section-kicker">02 / 扫描</p><h2>识别每个源桶里的模型</h2></div></div><p className="card-description">保存连接后先点击“测试连接”，再点击“开始扫描”。扫描会检查 .tar.gz 归档内容以识别模型，不会修改源对象。</p><button className="primary-button wide-button" type="button" onClick={() => void startScan()} disabled={!connection.configured || scanActive}>{scanActive ? "正在扫描…" : "开始扫描"}</button>{scanJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">扫描进度</span><span className={`scan-state ${scanActive ? "is-running" : ""}`}>{getStatusLabel(scanJob.status)}</span></div>{scanJob.current_source_bucket && <p className="progress-caption">当前源桶：{scanJob.current_source_bucket}</p>}<div className="progress-meta"><strong>{scanProgress}%</strong><span>已处理 {scanJob.progress.processed} / {scanJob.progress.total || "等待统计"} 个对象</span></div><progress value={scanProgress} max="100">{scanProgress}%</progress><p className="progress-caption">已隔离 {scanJob.progress.failed} 个异常对象，其余对象会继续扫描。</p></div>}</section>
       </div>
       {scanReport && <ReportView report={scanReport} mappings={mappings} missingMappings={missingMappings} preflight={preflight} onMappingChange={updateMapping} onSaveMappings={() => void saveMappings()} onCheckTargets={() => void checkTargets()} />}
-      <section className="card incremental-card"><div className="card-header"><div><p className="section-kicker">03 / 持续分流</p><h2>增量路由与历史回填</h2></div><label className="toggle-label"><input type="checkbox" checked={incremental?.continuous_enabled ?? false} onChange={(event) => void setContinuous(event.target.checked)} disabled={!incremental?.runtime_ready} /><span>自动分流</span></label></div><p className="card-description">运行密钥来自部署环境，不会在浏览器或数据卷保存。持续模式只读取新/变化归档并整包复制；历史回填需手动启动，列表和归档读取会产生 R2 请求成本。</p>{incremental && !incremental.runtime_ready && <p className="feedback feedback-error">{incremental.readiness_message}</p>}<div className="incremental-summary"><span>待处理 {incremental?.counts.queued ?? 0}</span><span>未映射 {incremental?.counts.unmapped ?? 0}</span><span>失败 {incremental?.counts.failed ?? 0}</span><span>冲突 {incremental?.counts.route_conflict ?? 0}</span><span>队列积压 {incremental?.queue_backlog_count ?? "未知"}</span></div><div className="button-row"><button className="secondary-button" type="button" onClick={() => void backfill("start")}>开始回填</button><button className="secondary-button" type="button" onClick={() => void backfill(incremental?.backfill.status === "paused" ? "resume" : "pause")}>{incremental?.backfill.status === "paused" ? "恢复回填" : "暂停回填"}</button><button className="text-button" type="button" onClick={() => void refreshIncremental()}>刷新状态</button></div><p className="report-footnote">回填状态：{incremental?.backfill.status ?? "idle"} · 已列举 {incremental?.backfill.total_seen ?? 0} 个对象 · 已分类 {incremental?.backfill.total_classified ?? 0} 个 · 对账：{incremental?.reconcile_last_run_at ?? "尚未运行"}</p><p className="report-footnote">队列拉取：{incremental?.queue_last_pull_at ?? "尚未运行"} · 队列确认：{incremental?.queue_last_ack_at ?? "尚未运行"}</p>{(incremental?.last_error || incremental?.backfill.error_code) && <p className="feedback feedback-error">最近错误：{incremental.last_error ?? incremental.backfill.error_code}</p>}</section>
+      <section className="card incremental-card" aria-labelledby="continuous-routing-title"><div className="card-header"><div><p className="section-kicker">03 / 运行</p><h2 id="continuous-routing-title">持续分流</h2></div><label className="toggle-label"><input type="checkbox" checked={incremental?.continuous_enabled ?? false} onChange={(event) => void setContinuous(event.target.checked)} disabled={!incremental?.runtime_ready} /><span>自动分流</span></label></div><p className="card-description">运行密钥来自部署环境，不会在浏览器或数据卷保存。持续模式只读取新/变化归档并整包复制；历史回填需手动启动，列表和归档读取会产生 R2 请求成本。</p>{incremental && !incremental.runtime_ready && <p className="feedback feedback-error">{incremental.readiness_message}</p>}<div className="incremental-summary"><span>待处理 {incremental?.counts.queued ?? 0}</span><span>未映射 {incremental?.counts.unmapped ?? 0}</span><span>失败 {incremental?.counts.failed ?? 0}</span><span>冲突 {incremental?.counts.route_conflict ?? 0}</span><span>队列积压 {incremental?.queue_backlog_count ?? "未知"}</span></div><div className="button-row"><button className="secondary-button" type="button" onClick={() => void backfill("start")}>开始回填</button><button className="secondary-button" type="button" onClick={() => void backfill(incremental?.backfill.status === "paused" ? "resume" : "pause")}>{incremental?.backfill.status === "paused" ? "恢复回填" : "暂停回填"}</button><button className="text-button" type="button" onClick={() => void refreshIncremental()}>刷新状态</button></div><p className="report-footnote">回填状态：{incremental?.backfill.status ?? "idle"} · 已列举 {incremental?.backfill.total_seen ?? 0} 个对象 · 已分类 {incremental?.backfill.total_classified ?? 0} 个 · 对账：{incremental?.reconcile_last_run_at ?? "尚未运行"}</p><p className="report-footnote">队列拉取：{incremental?.queue_last_pull_at ?? "尚未运行"} · 队列确认：{incremental?.queue_last_ack_at ?? "尚未运行"}</p>{(incremental?.last_error || incremental?.backfill.error_code) && <p className="feedback feedback-error">最近错误：{incremental.last_error ?? incremental.backfill.error_code}</p>}</section>
       {scanReport && <section className="card sync-card"><div className="card-header"><div><p className="section-kicker">04 / 运行</p><h2>开始同步</h2></div><span className="connection-state">不会覆盖已有对象</span></div><p className="card-description">程序会在 R2 内部复制完整对象，保留原 object key。目标桶已有同名对象时自动跳过。</p><button className="primary-button wide-button" type="button" onClick={() => void startSync()} disabled={!preflight?.success || syncActive}>{syncActive ? "正在同步…" : "开始同步"}</button>{!preflight?.success && <p className="action-note">请先保存完整映射，并点击“检查目标桶”。</p>}{syncJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">同步进度</span><span className={`scan-state ${syncActive ? "is-running" : ""}`}>{getStatusLabel(syncJob.status)}</span></div><div className="progress-meta"><strong>{syncProgress}%</strong><span>已处理 {syncJob.progress.processed} / {syncJob.progress.total || "等待统计"} 个复制动作</span></div><progress value={syncProgress} max="100">{syncProgress}%</progress>{syncJob.error && <p className="feedback feedback-error">{translateMessage(syncJob.error, "同步未能完成。")}</p>}</div>}{syncReport && <p className="report-footnote">复制 {syncReport.copied} 项 · 跳过 {syncReport.skipped} 项 · 失败 {syncReport.failed} 项</p>}</section>}
     </main>
   );
