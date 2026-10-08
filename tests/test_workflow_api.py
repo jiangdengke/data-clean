@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import time
 
@@ -34,6 +35,64 @@ def create_scan_report() -> ScanReport:
         "object_count": 1,
         "total_bytes": 10,
     }
+
+
+def test_legacy_scan_report_object_metadata_is_normalized_on_read(tmp_path: Path) -> None:
+    job_id = "00000000-0000-0000-0000-000000000001"
+    application = create_app(
+        AppSettings(admin_password="test-password", data_directory=tmp_path, cookie_secure=False)
+    )
+    legacy_report = create_scan_report()
+    bucket_report = legacy_report["source_buckets"][0]
+    bucket_report["unmatched_objects"] = [{"key": "unmatched.tar.gz", "size": 20}]
+    bucket_report["non_archive_objects"] = [{"key": "notes.txt", "size": 5}]
+    bucket_report["failed_objects"] = [
+        {
+            "key": "broken.tar.gz",
+            "size": 30,
+            "classification": "archive_corrupt",
+            "message": "Archive could not be read",
+        }
+    ]
+    bucket_report["timed_out_objects"] = [
+        {
+            "key": "slow.tar.gz",
+            "size": 40,
+            "classification": "timed_out",
+            "message": "Object scan exceeded the configured timeout",
+        }
+    ]
+    report_path = application.state.job_storage.reports_directory / f"{job_id}.json"
+    report_path.write_text(json.dumps(legacy_report, sort_keys=True), encoding="utf-8")
+    original_report_json = report_path.read_text(encoding="utf-8")
+
+    stored_report = application.state.job_storage.get_report(job_id)
+
+    assert stored_report is not None
+    stored_bucket = stored_report["source_buckets"][0]
+    assert stored_bucket["models"]["sol"]["objects"] == [
+        {"key": "path/file.tar.gz", "size": 10, "etag": None, "last_modified": None}
+    ]
+    assert stored_bucket["unmatched_objects"] == [
+        {"key": "unmatched.tar.gz", "size": 20, "etag": None, "last_modified": None}
+    ]
+    assert stored_bucket["non_archive_objects"] == [
+        {"key": "notes.txt", "size": 5, "etag": None, "last_modified": None}
+    ]
+    assert stored_bucket["failed_objects"] == bucket_report["failed_objects"]
+    assert stored_bucket["timed_out_objects"] == bucket_report["timed_out_objects"]
+    assert report_path.read_text(encoding="utf-8") == original_report_json
+
+    with TestClient(application) as client:
+        assert client.post("/api/login", json={"password": "test-password"}).status_code == 200
+        response = client.get(f"/api/scans/{job_id}/report")
+
+    assert response.status_code == 200
+    response_bucket = response.json()["source_buckets"][0]
+    assert response_bucket["models"]["sol"]["objects"][0]["etag"] is None
+    assert response_bucket["models"]["sol"]["objects"][0]["last_modified"] is None
+    assert response_bucket["unmatched_objects"][0]["etag"] is None
+    assert response_bucket["non_archive_objects"][0]["last_modified"] is None
 
 
 class FakeWorkflowClient:

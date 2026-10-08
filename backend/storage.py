@@ -16,6 +16,32 @@ DEFAULT_INCREMENTAL_MAX_ATTEMPTS = 5
 MAX_RETRY_DELAY_SECONDS = 300
 
 
+def _add_missing_object_metadata(objects: object) -> None:
+    if not isinstance(objects, list):
+        return
+    for object_reference in objects:
+        if not isinstance(object_reference, dict):
+            continue
+        object_reference.setdefault("etag", None)
+        object_reference.setdefault("last_modified", None)
+
+
+def _normalize_legacy_scan_report(report: dict[str, Any]) -> None:
+    source_buckets = report.get("source_buckets")
+    if not isinstance(source_buckets, list):
+        return
+    for source_bucket in source_buckets:
+        if not isinstance(source_bucket, dict):
+            continue
+        models = source_bucket.get("models")
+        if isinstance(models, dict):
+            for model_report in models.values():
+                if isinstance(model_report, dict):
+                    _add_missing_object_metadata(model_report.get("objects"))
+        _add_missing_object_metadata(source_bucket.get("unmatched_objects"))
+        _add_missing_object_metadata(source_bucket.get("non_archive_objects"))
+
+
 def current_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -626,6 +652,7 @@ class JobStorage:
             loaded_report = json.load(report_file)
         if not isinstance(loaded_report, dict):
             raise ValueError("Stored scan report is not an object")
+        _normalize_legacy_scan_report(loaded_report)
         return cast(ScanReport, loaded_report)
 
     @property
