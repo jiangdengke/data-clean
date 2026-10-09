@@ -115,7 +115,12 @@ async def scan_object_with_retries(
 def create_object_reference(source_object: SourceObject) -> ObjectReference:
     """Convert internal object metadata to the report's safe shape."""
 
-    return {"key": source_object.key, "size": source_object.size}
+    return {
+        "key": source_object.key,
+        "size": source_object.size,
+        "etag": source_object.etag,
+        "last_modified": source_object.last_modified,
+    }
 
 
 def create_failed_object(source_object: SourceObject, classification: str) -> FailedObject:

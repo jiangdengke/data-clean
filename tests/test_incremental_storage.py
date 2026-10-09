@@ -98,8 +98,17 @@ def test_queue_event_payload_is_sanitized(tmp_path: Path) -> None:
         "credentials": "do-not-store",
         "token": "do-not-store",
     }
-    store.ingest_event("event-1", event, SourceObject("a.tar.gz", 10, "etag"))
+    object_id, created = store.ingest_event(
+        "event-1", event, SourceObject("a.tar.gz", 10, "etag")
+    )
+    duplicate_id, duplicate_created = store.ingest_event(
+        "event-1", event, SourceObject("a.tar.gz", 10, "etag")
+    )
 
+    assert isinstance(object_id, int)
+    assert created is True
+    assert duplicate_id == object_id
+    assert duplicate_created is False
     with store._connect() as connection:
         payload = connection.execute("SELECT payload_json FROM queue_events").fetchone()["payload_json"]
     assert "do-not-store" not in payload

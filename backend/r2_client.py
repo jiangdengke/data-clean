@@ -1,6 +1,7 @@
 """S3-compatible R2 access and Cloudflare Queue HTTP pull primitives."""
 
 from collections.abc import Iterator
+import threading
 from typing import Any, BinaryIO, Protocol, cast
 
 import boto3
@@ -8,6 +9,14 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from .models import ConnectionSettings, SourceObject
+from .transfer import (
+    Boto3TransferAdapter,
+    ObjectTransferAdapter,
+    RcloneTransferAdapter,
+    TransferOutcome,
+    TargetVerificationError,
+    TransferRequest,
+)
 
 
 class R2Client(Protocol):
@@ -17,7 +26,18 @@ class R2Client(Protocol):
     def open_object_conditional(self, bucket_name: str, object_key: str, etag: str | None = None) -> BinaryIO: ...
     def head_object(self, bucket_name: str, object_key: str) -> SourceObject: ...
     def object_exists(self, bucket_name: str, object_key: str) -> bool: ...
-    def copy_object(self, source_bucket: str, source_key: str, target_bucket: str, target_key: str) -> None: ...
+    def copy_object(
+        self,
+        source_bucket: str,
+        source_key: str,
+        target_bucket: str,
+        target_key: str,
+    ) -> None: ...
+    def transfer_object(
+        self,
+        request: TransferRequest,
+        cancellation_event: threading.Event | None = None,
+    ) -> TransferOutcome: ...
 
 
 class Boto3R2Client:
@@ -32,6 +52,25 @@ class Boto3R2Client:
             region_name="auto",
             config=Config(connect_timeout=120, read_timeout=120, retries={"max_attempts": 0}),
         )
+        self._transfer_adapter = self._create_transfer_adapter(connection_settings)
+
+    def _create_transfer_adapter(
+        self, connection_settings: ConnectionSettings
+    ) -> ObjectTransferAdapter:
+        if connection_settings.transfer_adapter == "boto3":
+            return Boto3TransferAdapter(self._client)
+        if connection_settings.transfer_adapter == "rclone":
+            return RcloneTransferAdapter(
+                binary_path=connection_settings.rclone_binary_path,
+                endpoint=connection_settings.endpoint,
+                access_key_id=connection_settings.access_key_id,
+                secret_access_key=connection_settings.secret_access_key,
+                source_bucket=connection_settings.source_bucket,
+                timeout_seconds=connection_settings.rclone_transfer_timeout_seconds,
+                output_limit_bytes=connection_settings.rclone_output_limit_bytes,
+                low_level_retries=connection_settings.rclone_low_level_retries,
+            )
+        raise ValueError("Unsupported R2 transfer adapter")
 
     def test_source_bucket(self, bucket_name: str) -> None:
         self._client.head_bucket(Bucket=bucket_name)
@@ -111,8 +150,32 @@ class Boto3R2Client:
             raise
         return True
 
-    def copy_object(self, source_bucket: str, source_key: str, target_bucket: str, target_key: str) -> None:
-        self._client.copy_object(Bucket=target_bucket, Key=target_key, CopySource={"Bucket": source_bucket, "Key": source_key})
+    def copy_object(
+        self,
+        source_bucket: str,
+        source_key: str,
+        target_bucket: str,
+        target_key: str,
+    ) -> None:
+        """Retain the original boto3 CopyObject contract for compatibility."""
+        self._client.copy_object(
+            Bucket=target_bucket,
+            Key=target_key,
+            CopySource={"Bucket": source_bucket, "Key": source_key},
+        )
+
+    def transfer_object(
+        self,
+        request: TransferRequest,
+        cancellation_event: threading.Event | None = None,
+    ) -> TransferOutcome:
+        outcome = self._transfer_adapter.transfer_object(request, cancellation_event)
+        if not self._transfer_adapter.requires_target_verification:
+            return outcome
+        target = self.head_object(request.target_bucket, request.target_key)
+        if target.size != request.expected_size:
+            raise TargetVerificationError("Transferred object size verification failed")
+        return outcome
 
 
 def create_r2_client(connection_settings: ConnectionSettings) -> R2Client:

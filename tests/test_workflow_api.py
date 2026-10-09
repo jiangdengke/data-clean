@@ -106,6 +106,9 @@ class FakeWorkflowClient:
     def object_exists(self, bucket_name: str, object_key: str) -> bool:
         return False
 
+    def head_object(self, bucket_name: str, object_key: str) -> SourceObject:
+        return SourceObject(object_key, 10, "etag")
+
     def copy_object(
         self,
         source_bucket: str,

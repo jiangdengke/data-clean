@@ -65,6 +65,14 @@ The named `r2-model-scanner-data` volume stores credential-free jobs, mappings, 
 `/var/lib/r2-model-scanner`. Put HTTPS termination in a trusted reverse proxy before exposing this service
 publicly. `COOKIE_SECURE=true` requires HTTPS; use `false` only for local HTTP development.
 
+The production image includes checksum-verified rclone `v1.74.3` binaries for `amd64` and `arm64`, but transfer selection remains the backward-compatible `boto3` default. Verify the bundled binary without contacting R2:
+
+```bash
+ADMIN_PASSWORD=local-readiness-check docker compose run --rm --no-deps r2-model-scanner rclone version
+```
+
+To opt in, set `R2_TRANSFER_ADAPTER=rclone`; the image default `RCLONE_BINARY_PATH=/usr/local/bin/rclone` and bounded timeout/retry/output limits are shown in `.env.example`. Rclone readiness requires that path to be an executable file. Keep all R2 credentials in deployment Secret environment variables. The application passes them directly to each configless rclone subprocess and does not create or persist `rclone.conf`. Set `R2_TRANSFER_ADAPTER=boto3` and restart the service to roll back. See [Deployment Notes](docs/deployment.md#rclone-transfer-adapter) for the behavior and limitations.
+
 The container intentionally runs one Uvicorn process because active scan and sync locking are process-local.
 On restart, the deployment reinjects the R2 and Cloudflare Queue runtime secrets, while the SQLite-backed
 continuous-routing toggle and work queues persist; if continuous mode was enabled, it resumes automatically.

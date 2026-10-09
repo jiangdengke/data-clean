@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/quality.md","reason":"检查方案与现有后端质量要求的符合度。"}
+{"file":".trellis/spec/backend/performance.md","reason":"检查大规模列表、归档读取和后台任务设计。"}
+{"file":".trellis/tasks/10-07-design-large-scale-r2-incremental-routing/research/r2-object-events.md","reason":"复核事件发现和丢失事件补偿。"}
+{"file":".trellis/tasks/10-07-design-large-scale-r2-incremental-routing/research/incremental-indexing.md","reason":"复核增量索引、回填和幂等设计。"}

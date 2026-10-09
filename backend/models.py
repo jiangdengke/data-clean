@@ -16,6 +16,11 @@ class ConnectionSettings:
     source_bucket: str = ""
     credential_ref: str = "default"
     source_buckets: tuple[str, ...] = ()
+    transfer_adapter: str = "boto3"
+    rclone_binary_path: str = "/usr/local/bin/rclone"
+    rclone_transfer_timeout_seconds: int = 3600
+    rclone_output_limit_bytes: int = 64 * 1024
+    rclone_low_level_retries: int = 3
 
 
 @dataclass(frozen=True)

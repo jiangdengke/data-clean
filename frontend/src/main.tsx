@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { FormEvent } from "react";
+import type { FormEvent, KeyboardEvent } from "react";
 import "./styles.css";
 
 type ConnectionProfile = { source_bucket: string; endpoint: string; credential_ref: string };
@@ -28,7 +28,12 @@ type JobStatus = {
   error: string | null;
 };
 
-type ObjectReference = { key: string; size: number };
+type ObjectReference = {
+  key: string;
+  size: number;
+  etag?: string | null;
+  last_modified?: string | null;
+};
 type ModelReport = { object_count: number; total_bytes: number; objects: ObjectReference[] };
 type SourceBucketReport = {
   source_bucket: string;
@@ -74,6 +79,38 @@ type IncrementalStatus = {
   last_error: string | null;
 };
 
+type WorkflowStage = "connection" | "scan" | "mapping" | "operations";
+
+const WORKFLOW_STAGES: { id: WorkflowStage; number: string; label: string }[] = [
+  { id: "connection", number: "1", label: "源桶连接" },
+  { id: "scan", number: "2", label: "扫描数据" },
+  { id: "mapping", number: "3", label: "分流映射" },
+  { id: "operations", number: "4", label: "同步与持续运行" },
+];
+
+function mergeReportMappings(report: ScanReport, savedMappings: Mapping[]): Mapping[] {
+  const existing = new Map(savedMappings.map((mapping) => [`${mapping.source_bucket}\u0000${mapping.model_name}`, mapping.target_bucket]));
+  return report.source_buckets.flatMap((bucket) => Object.keys(bucket.models).map((modelName) => ({
+    source_bucket: bucket.source_bucket,
+    model_name: modelName,
+    target_bucket: existing.get(`${bucket.source_bucket}\u0000${modelName}`) ?? "",
+  })));
+}
+
+function configuredSourceCount(connection: ConnectionView): number {
+  if (!connection.configured) return 0;
+  const buckets = connection.connections.length
+    ? connection.connections.map((profile) => profile.source_bucket)
+    : connection.source_buckets;
+  return new Set(buckets.filter((bucket) => bucket.trim())).size;
+}
+
+function getInitialStage(connection: ConnectionView, report: ScanReport | null, mappings: Mapping[]): WorkflowStage {
+  if (configuredSourceCount(connection) === 0) return "connection";
+  if (!report) return "scan";
+  return mappings.some((mapping) => !mapping.target_bucket.trim()) ? "mapping" : "operations";
+}
+
 async function callApi<ResponseBody>(path: string, init?: RequestInit): Promise<ResponseBody> {
   const response = await fetch(path, {
     ...init,
@@ -116,6 +153,7 @@ function translateMessage(message: string, fallback: string): string {
     "All target buckets are accessible": "目标桶检查通过，可以开始同步。",
     "Target bucket is accessible": "目标桶可访问。",
     "Target bucket is not accessible": "目标桶无法访问。",
+    "Rclone transfer requires Cloudflare R2 HTTPS endpoints": "rclone 仅支持同一 Cloudflare R2 账户的 HTTPS endpoint。",
     "All source buckets are readable": "所有源桶连接成功，可以开始扫描。",
     "The scan failed before a report was generated": "扫描失败，未能生成报告。",
     "The sync failed before a report was generated": "同步失败，未能生成报告。",
@@ -172,119 +210,130 @@ function LoginScreen({ onLogin }: { onLogin: () => void }): React.JSX.Element {
   );
 }
 
-type ReportViewProps = {
-  report: ScanReport;
-  mappings: Mapping[];
-  missingMappings: number;
-  preflight: SyncPreflight | null;
-  onMappingChange: (sourceBucket: string, modelName: string, targetBucket: string) => void;
-  onSaveMappings: () => void;
-  onCheckTargets: () => void;
-};
+type ScanReportViewProps = { report: ScanReport };
 
-function ReportView({
-  report,
-  mappings,
-  missingMappings,
-  preflight,
-  onMappingChange,
-  onSaveMappings,
-  onCheckTargets,
-}: ReportViewProps): React.JSX.Element {
+function ScanReportView({ report }: ScanReportViewProps): React.JSX.Element {
   const modelCount = report.source_buckets.reduce((count, bucket) => count + Object.keys(bucket.models).length, 0);
   const failedCount = report.source_buckets.reduce((count, bucket) => count + bucket.failed_objects.length + bucket.timed_out_objects.length, 0);
-  const findMapping = (sourceBucket: string, modelName: string): Mapping | undefined => mappings.find((mapping) => mapping.source_bucket === sourceBucket && mapping.model_name === modelName);
 
   return (
-    <section className="source-report-section">
-      <div className="report-overview">
-        <div className="report-overview-heading">
-          <div>
-            <p className="section-kicker">扫描结果</p>
-            <h2>源桶与模型</h2>
-          </div>
-          <span className="report-complete">{modelCount} 个模型待分流</span>
+    <section className="report-section" aria-labelledby="latest-report-title">
+      <div className="report-heading">
+        <div>
+          <p className="section-kicker">最新报告</p>
+          <h3 id="latest-report-title">扫描结果明细</h3>
         </div>
-        <div className="summary-grid">
-          <div className="stat-card"><span className="stat-label">源对象</span><strong className="stat-value">{report.object_count}</strong></div>
-          <div className="stat-card"><span className="stat-label">数据总量</span><strong className="stat-value">{formatBytes(report.total_bytes)}</strong></div>
-          <div className="stat-card"><span className="stat-label">源桶</span><strong className="stat-value">{report.source_buckets.length}</strong></div>
-          <div className="stat-card"><span className="stat-label">异常对象</span><strong className="stat-value">{failedCount}</strong></div>
-        </div>
+        <span className="report-complete">{modelCount} 个模型</span>
       </div>
 
-      <div className="source-bucket-grid">
+      <div className="summary-grid" aria-label="扫描报告摘要">
+        <div className="stat-item"><span className="stat-label">源对象</span><strong className="stat-value">{report.object_count}</strong></div>
+        <div className="stat-item"><span className="stat-label">数据总量</span><strong className="stat-value">{formatBytes(report.total_bytes)}</strong></div>
+        <div className="stat-item"><span className="stat-label">源桶</span><strong className="stat-value">{report.source_buckets.length}</strong></div>
+        <div className="stat-item"><span className="stat-label">异常对象</span><strong className="stat-value">{failedCount}</strong></div>
+      </div>
+
+      <div className="report-bucket-list">
         {report.source_buckets.map((bucketReport) => (
-          <article className="source-bucket-card" key={bucketReport.source_bucket}>
-            <div className="source-bucket-header">
-              <div>
-                <p className="section-kicker">源桶</p>
-                <h3>{bucketReport.source_bucket}</h3>
-              </div>
+          <details className="report-bucket" key={bucketReport.source_bucket}>
+            <summary className="report-bucket-summary">
+              <span className="report-bucket-title">
+                <strong>{bucketReport.source_bucket}</strong>
+                <small>{bucketReport.object_count} 个对象 · {Object.keys(bucketReport.models).length} 个模型 · {formatBytes(bucketReport.total_bytes)}</small>
+              </span>
               <span className={`bucket-status ${bucketReport.error ? "is-error" : "is-ready"}`}>
                 {bucketReport.error ? "读取失败" : "已识别"}
               </span>
+            </summary>
+            <div className="report-bucket-content">
+              {bucketReport.error ? (
+                <p className="feedback feedback-error">{translateMessage(bucketReport.error, "源桶访问失败，请检查连接后重试。")}</p>
+              ) : Object.keys(bucketReport.models).length ? (
+                <div className="report-model-list">
+                  {Object.entries(bucketReport.models).map(([modelName, modelReport]) => (
+                    <details className="report-model-row" key={modelName}>
+                      <summary>
+                        <span><strong>{modelName}</strong><small>{modelReport.object_count} 个对象 · {formatBytes(modelReport.total_bytes)}</small></span>
+                        <span className="detail-action">查看对象</span>
+                      </summary>
+                      <ul className="object-list">
+                        {modelReport.objects.map((sourceObject) => (
+                          <li key={sourceObject.key}>
+                            <code>{sourceObject.key}</code>
+                            <span>{formatBytes(sourceObject.size)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  ))}
+                </div>
+              ) : (
+                <p className="empty-state">此源桶没有识别到可分流模型。</p>
+              )}
+              <p className="report-footnote">未匹配 {bucketReport.unmatched_objects.length} 项 · 非归档 {bucketReport.non_archive_objects.length} 项 · 失败 {bucketReport.failed_objects.length} 项 · 超时 {bucketReport.timed_out_objects.length} 项</p>
             </div>
-            <div className="source-bucket-stats">
-              <span>{bucketReport.object_count} 个对象</span>
-              <span>{Object.keys(bucketReport.models).length} 个模型</span>
-              <span>{formatBytes(bucketReport.total_bytes)}</span>
-            </div>
-            {bucketReport.error ? (
-              <p className="feedback feedback-error">{translateMessage(bucketReport.error, "源桶访问失败，请检查连接后重试。")}</p>
-            ) : (
-              <div className="model-card-grid">
-                {Object.entries(bucketReport.models).map(([modelName, modelReport]) => {
-                  const mapping = findMapping(bucketReport.source_bucket, modelName);
-                  return (
-                    <article className="model-card" key={modelName}>
-                      <div className="model-card-header">
-                        <div>
-                          <p className="model-card-label">模型</p>
-                          <h4>{modelName}</h4>
-                        </div>
-                        <span className="model-meta">{modelReport.object_count} 个对象</span>
-                      </div>
-                      <label className="model-target-field" htmlFor={`target-${bucketReport.source_bucket}-${modelName}`}>
-                        <span>目标桶</span>
-                        <input
-                          id={`target-${bucketReport.source_bucket}-${modelName}`}
-                          value={mapping?.target_bucket ?? ""}
-                          onChange={(event) => onMappingChange(bucketReport.source_bucket, modelName, event.target.value)}
-                          placeholder={`例如：${bucketReport.source_bucket} ${modelName}`}
-                        />
-                      </label>
-                      <details className="object-list">
-                        <summary>查看对象 · {formatBytes(modelReport.total_bytes)}</summary>
-                        <ul>
-                          {modelReport.objects.map((sourceObject) => (
-                            <li key={sourceObject.key}>
-                              <code>{sourceObject.key}</code>
-                              <span>{formatBytes(sourceObject.size)}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </details>
-                    </article>
-                  );
-                })}
-              </div>
-            )}
-            <p className="report-footnote">未匹配 {bucketReport.unmatched_objects.length} 项 · 非归档 {bucketReport.non_archive_objects.length} 项 · 失败 {bucketReport.failed_objects.length} 项 · 超时 {bucketReport.timed_out_objects.length} 项</p>
-          </article>
+          </details>
         ))}
       </div>
+    </section>
+  );
+}
 
-      <div className="mapping-toolbar">
+type MappingViewProps = {
+  report: ScanReport;
+  mappings: Mapping[];
+  missingMappings: number;
+  onMappingChange: (sourceBucket: string, modelName: string, targetBucket: string) => void;
+  onSaveMappings: () => void;
+};
+
+function MappingView({ report, mappings, missingMappings, onMappingChange, onSaveMappings }: MappingViewProps): React.JSX.Element {
+  const findMapping = (sourceBucket: string, modelName: string): Mapping | undefined => mappings.find((mapping) => mapping.source_bucket === sourceBucket && mapping.model_name === modelName);
+  const mappedCount = mappings.length - missingMappings;
+
+  return (
+    <section className="mapping-workspace" aria-labelledby="mapping-workspace-title">
+      <div className="mapping-heading">
         <div>
-          <p className="section-kicker">目标桶映射</p>
-          <p>{missingMappings ? `还有 ${missingMappings} 项模型未填写目标桶` : "所有模型都已填写目标桶"}</p>
+          <p className="section-kicker">映射状态</p>
+          <h3 id="mapping-workspace-title">{mappedCount} / {mappings.length} 个模型已配置</h3>
         </div>
-        <div className="button-row">
-          <button className="primary-button" type="button" onClick={onSaveMappings} disabled={!mappings.length || missingMappings > 0}>保存映射</button>
-          <button className="secondary-button" type="button" onClick={onCheckTargets} disabled={!mappings.length || missingMappings > 0}>检查目标桶</button>
-        </div>
-        {preflight && <div className="preflight-list">{preflight.targets.map((target) => <div className="preflight-row" key={target.target_bucket}><span className={`status-dot ${target.accessible ? "is-success" : "is-error"}`} aria-hidden="true" /><span>{target.target_bucket}</span><span>{target.accessible ? "可访问" : "无法访问"}</span></div>)}</div>}
+        <button className="primary-button" type="button" onClick={onSaveMappings} disabled={!mappings.length || missingMappings > 0}>保存映射</button>
+      </div>
+
+      {missingMappings > 0 && <p className="stage-notice is-warning">还有 {missingMappings} 个模型未填写目标桶。填写完成后保存，再到第 4 阶段检查目标桶。</p>}
+
+      <div className="mapping-bucket-list">
+        {report.source_buckets.map((bucketReport) => (
+          <section className="mapping-bucket-group" key={bucketReport.source_bucket} aria-label={`${bucketReport.source_bucket} 模型映射`}>
+            <div className="mapping-bucket-heading">
+              <h4>{bucketReport.source_bucket}</h4>
+              <span>{Object.keys(bucketReport.models).length} 个模型</span>
+            </div>
+            <div className="mapping-model-list">
+              {Object.entries(bucketReport.models).map(([modelName, modelReport]) => {
+                const mapping = findMapping(bucketReport.source_bucket, modelName);
+                const isMapped = Boolean(mapping?.target_bucket.trim());
+                return (
+                  <label className="mapping-model-row" key={modelName}>
+                    <span className="mapping-model-copy">
+                      <span><strong>{modelName}</strong><span className={`bucket-status ${isMapped ? "is-ready" : "is-pending"}`}>{isMapped ? "已填写" : "未映射"}</span></span>
+                      <small>{modelReport.object_count} 个对象 · {formatBytes(modelReport.total_bytes)}</small>
+                    </span>
+                    <span className="mapping-target-field">
+                      <span>目标桶</span>
+                      <input
+                        value={mapping?.target_bucket ?? ""}
+                        onChange={(event) => onMappingChange(bucketReport.source_bucket, modelName, event.target.value)}
+                        placeholder={`例如：${bucketReport.source_bucket}-${modelName}`}
+                      />
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </section>
+        ))}
       </div>
     </section>
   );
@@ -497,6 +546,17 @@ function ConnectionProfiles({ connections, onApply, onRemove }: ConnectionProfil
   );
 }
 
+function StageActions({ previous, next, onSelect }: { previous?: WorkflowStage; next?: WorkflowStage; onSelect: (stage: WorkflowStage) => void }): React.JSX.Element {
+  const previousStage = previous ? WORKFLOW_STAGES.find((stage) => stage.id === previous) : undefined;
+  const nextStage = next ? WORKFLOW_STAGES.find((stage) => stage.id === next) : undefined;
+  return (
+    <footer className="stage-actions">
+      {previousStage ? <button className="secondary-button" type="button" onClick={() => onSelect(previousStage.id)}>上一步：{previousStage.label}</button> : <span />}
+      {nextStage && <button className="primary-button" type="button" onClick={() => onSelect(nextStage.id)}>下一步：{nextStage.label}</button>}
+    </footer>
+  );
+}
+
 function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
   const [connection, setConnection] = useState<ConnectionView>({ configured: false, endpoint: null, source_buckets: [], connections: [] });
   const [connections, setConnections] = useState<ConnectionProfile[]>([{ source_bucket: "", endpoint: "", credential_ref: "default" }]);
@@ -509,11 +569,51 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
   const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
   const [preflight, setPreflight] = useState<SyncPreflight | null>(null);
   const [incremental, setIncremental] = useState<IncrementalStatus | null>(null);
+  const [activeStage, setActiveStage] = useState<WorkflowStage | null>(null);
+  const stageWasManuallySelectedRef = useRef(false);
+  const initialStageSelectedRef = useRef(false);
+
+  function selectInitialStage(stage: WorkflowStage): void {
+    if (initialStageSelectedRef.current || stageWasManuallySelectedRef.current) return;
+    initialStageSelectedRef.current = true;
+    setActiveStage(stage);
+  }
 
   useEffect(() => {
-    void Promise.all([callApi<ConnectionView>("/api/connection"), callApi<{ mappings: Mapping[] }>("/api/mappings"), callApi<JobStatus | null>("/api/scans/latest"), callApi<JobStatus | null>("/api/sync/latest"), callApi<IncrementalStatus>("/api/incremental/status")]).then(([savedConnection, savedMappings, latestScan, latestSync, savedIncremental]) => {
-      setConnection(savedConnection); setConnections(savedConnection.connections.length ? savedConnection.connections : savedConnection.source_buckets.map((source_bucket) => ({ source_bucket, endpoint: savedConnection.endpoint ?? "", credential_ref: "default" }))); setMappings(savedMappings.mappings); setIncremental(savedIncremental); if (latestScan) setScanJob(latestScan); if (latestSync) setSyncJob(latestSync);
-    }).catch((error: unknown) => setErrorMessage(localizedError(error, "无法读取工作区状态，请刷新页面重试。")));
+    async function loadWorkspace(): Promise<void> {
+      try {
+        const [savedConnection, savedMappings, latestScan] = await Promise.all([
+          callApi<ConnectionView>("/api/connection"),
+          callApi<{ mappings: Mapping[] }>("/api/mappings"),
+          callApi<JobStatus | null>("/api/scans/latest"),
+        ]);
+        let latestReport: ScanReport | null = null;
+        if (latestScan?.report_available) {
+          try {
+            latestReport = await callApi<ScanReport>(`/api/scans/${latestScan.job_id}/report`);
+          } catch (error) {
+            setErrorMessage(localizedError(error, "无法读取扫描报告。"));
+          }
+        }
+        const reportMappings = latestReport ? mergeReportMappings(latestReport, savedMappings.mappings) : savedMappings.mappings;
+        setConnection(savedConnection);
+        setConnections(savedConnection.connections.length ? savedConnection.connections : savedConnection.source_buckets.map((source_bucket) => ({ source_bucket, endpoint: savedConnection.endpoint ?? "", credential_ref: "default" })));
+        setMappings(reportMappings);
+        setScanJob(latestScan);
+        setScanReport(latestReport);
+        selectInitialStage(getInitialStage(savedConnection, latestReport, reportMappings));
+      } catch (error) {
+        setErrorMessage(localizedError(error, "无法读取工作区状态，请刷新页面重试。"));
+        selectInitialStage("connection");
+      }
+    }
+    void loadWorkspace();
+    void callApi<JobStatus | null>("/api/sync/latest")
+      .then(setSyncJob)
+      .catch((error: unknown) => setErrorMessage((current) => current || localizedError(error, "无法读取最新同步状态。")));
+    void callApi<IncrementalStatus>("/api/incremental/status")
+      .then(setIncremental)
+      .catch((error: unknown) => setErrorMessage((current) => current || localizedError(error, "无法读取持续分流状态。")));
   }, []);
 
   useEffect(() => {
@@ -523,8 +623,11 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
   }, [scanJob]);
 
   useEffect(() => {
-    if (!scanJob?.report_available) return;
-    void callApi<ScanReport>(`/api/scans/${scanJob.job_id}/report`).then((report) => { setScanReport(report); setMappings((currentMappings) => { const existing = new Map(currentMappings.map((mapping) => [`${mapping.source_bucket}\u0000${mapping.model_name}`, mapping.target_bucket])); return report.source_buckets.flatMap((bucket) => Object.keys(bucket.models).map((modelName) => ({ source_bucket: bucket.source_bucket, model_name: modelName, target_bucket: existing.get(`${bucket.source_bucket}\u0000${modelName}`) ?? "" }))); }); }).catch((error: unknown) => setErrorMessage(localizedError(error, "无法读取扫描报告。")));
+    if (!scanJob?.report_available || scanReport?.job_id === scanJob.job_id) return;
+    void callApi<ScanReport>(`/api/scans/${scanJob.job_id}/report`).then((report) => {
+      setScanReport(report);
+      setMappings((currentMappings) => mergeReportMappings(report, currentMappings));
+    }).catch((error: unknown) => setErrorMessage(localizedError(error, "无法读取扫描报告。")));
   }, [scanJob?.job_id, scanJob?.report_available]);
 
   useEffect(() => {
@@ -548,7 +651,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
   async function testConnection(): Promise<void> { try { const result = await callApi<{ success: boolean; reason: string }>("/api/connection/test", { method: "POST" }); if (result.success) { setErrorMessage(""); setMessage(translateMessage(result.reason, "连接测试已完成。")); } else { setMessage(""); setErrorMessage(translateMessage(result.reason, "连接测试失败，请检查连接信息。")); } } catch (error) { setErrorMessage(localizedError(error, "连接测试失败，请检查连接信息。")); } }
   async function startScan(): Promise<void> { try { const startedJob = await callApi<{ job_id: string; status: string }>("/api/scans", { method: "POST" }); setScanReport(null); setScanJob({ job_id: startedJob.job_id, status: startedJob.status, progress: { total: 0, processed: 0, failed: 0 }, report_available: false, error: null }); setMessage("扫描任务已启动。"); } catch (error) { setErrorMessage(localizedError(error, "无法启动扫描。")); } }
   async function saveMappings(): Promise<void> { try { const saved = await callApi<{ mappings: Mapping[] }>("/api/mappings", { method: "POST", body: JSON.stringify({ mappings }) }); setMappings(saved.mappings); setPreflight(null); setErrorMessage(""); setMessage("模型到目标桶的映射已保存。"); } catch (error) { setErrorMessage(localizedError(error, "保存映射失败。")); } }
-  async function checkTargets(): Promise<void> { if (!scanJob) return; try { const result = await callApi<SyncPreflight>("/api/sync/preflight", { method: "POST", body: JSON.stringify({ scan_job_id: scanJob.job_id }) }); setPreflight(result); setMessage(translateMessage(result.reason, result.reason)); } catch (error) { setErrorMessage(localizedError(error, "目标桶检查失败。")); } }
+  async function checkTargets(): Promise<void> { if (!scanJob) return; try { const result = await callApi<SyncPreflight>("/api/sync/preflight", { method: "POST", body: JSON.stringify({ scan_job_id: scanJob.job_id }) }); setPreflight(result); if (result.success) { setErrorMessage(""); setMessage(translateMessage(result.reason, result.reason)); } else { setMessage(""); setErrorMessage(translateMessage(result.reason, result.reason)); } } catch (error) { setMessage(""); setErrorMessage(localizedError(error, "目标桶检查失败。")); } }
   async function startSync(): Promise<void> { if (!scanJob) return; try { const startedJob = await callApi<{ sync_job_id: string; status: string }>("/api/sync", { method: "POST", body: JSON.stringify({ scan_job_id: scanJob.job_id }) }); setSyncReport(null); setSyncJob({ job_id: startedJob.sync_job_id, sync_job_id: startedJob.sync_job_id, status: startedJob.status, progress: { total: 0, processed: 0, failed: 0 }, report_available: false, error: null }); setMessage("同步任务已启动。已有对象会自动跳过，不会覆盖。"); } catch (error) { setErrorMessage(localizedError(error, "无法启动同步，请先通过目标桶检查。")); } }
   async function setContinuous(enabled: boolean): Promise<void> { try { const result = await callApi<IncrementalStatus>("/api/incremental/continuous", { method: "POST", body: JSON.stringify({ enabled }) }); setIncremental(result); setMessage(enabled ? "持续分流已开启。" : "持续分流已暂停。"); } catch (error) { setErrorMessage(localizedError(error, "无法更新持续分流状态。")); } }
   async function backfill(action: "start" | "pause" | "resume"): Promise<void> { try { const result = await callApi<IncrementalStatus>("/api/incremental/backfill", { method: "POST", body: JSON.stringify({ action }) }); setIncremental(result); setMessage("历史回填状态已更新。"); } catch (error) { setErrorMessage(localizedError(error, "无法更新历史回填。")); } }
@@ -560,34 +663,205 @@ function Dashboard({ onLogout }: { onLogout: () => void }): React.JSX.Element {
   const scanProgress = scanJob && scanJob.progress.total > 0 ? Math.round((scanJob.progress.processed / scanJob.progress.total) * 100) : 0;
   const syncProgress = syncJob && syncJob.progress.total > 0 ? Math.round((syncJob.progress.processed / syncJob.progress.total) * 100) : 0;
   const missingMappings = useMemo(() => mappings.filter((mapping) => !mapping.target_bucket.trim()).length, [mappings]);
+  const sourceCount = configuredSourceCount(connection);
+  const mappedCount = mappings.length - missingMappings;
+
+  function selectStage(stage: WorkflowStage): void {
+    stageWasManuallySelectedRef.current = true;
+    initialStageSelectedRef.current = true;
+    setActiveStage(stage);
+    window.requestAnimationFrame(() => document.getElementById(`stage-tab-${stage}`)?.focus());
+  }
+
+  function handleStageKeyDown(event: KeyboardEvent<HTMLButtonElement>, stage: WorkflowStage): void {
+    const currentIndex = WORKFLOW_STAGES.findIndex((item) => item.id === stage);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % WORKFLOW_STAGES.length;
+    else if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + WORKFLOW_STAGES.length) % WORKFLOW_STAGES.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = WORKFLOW_STAGES.length - 1;
+    else return;
+    event.preventDefault();
+    selectStage(WORKFLOW_STAGES[nextIndex].id);
+  }
+
+  const scanSummary = scanActive
+    ? `${getStatusLabel(scanJob.status)} · ${scanProgress}%`
+    : scanReport
+      ? `${getStatusLabel(scanJob?.status ?? "completed")} · ${scanReport.object_count} 个对象`
+      : scanJob
+        ? getStatusLabel(scanJob.status)
+        : "尚无报告";
+  const mappingSummary = scanReport ? `${mappedCount} / ${mappings.length} 已配置` : "等待扫描报告";
+  const operationSummary = syncActive
+    ? `同步中 · ${syncProgress}%`
+    : incremental === null
+      ? "正在载入"
+      : incremental.continuous_enabled
+        ? "持续运行中"
+        : "持续运行已暂停";
 
   return (
     <main className="page-shell">
-      <header className="page-header"><div className="brand-lockup"><span className="brand-mark" aria-hidden="true">R2</span><span className="brand-name">R2 模型同步</span></div><div className="header-actions"><span className="session-indicator"><span className="status-dot" aria-hidden="true" /> 已登录</span><button className="secondary-button" type="button" onClick={() => void logout()}>退出</button></div></header>
-      <p className="read-only-note"><span className="status-dot" aria-hidden="true" /> 扫描阶段只读；只有点击“开始同步”后才会执行复制。</p>
+      <header className="page-header">
+        <div className="brand-lockup"><span className="brand-mark" aria-hidden="true">R2</span><span className="brand-name">R2 模型同步</span></div>
+        <div className="header-actions"><span className="session-indicator"><span className="status-dot" aria-hidden="true" /> 已登录</span><button className="secondary-button" type="button" onClick={() => void logout()}>退出</button></div>
+      </header>
+
+      <section className="workflow-summary" aria-label="工作流摘要">
+        <div className="workflow-summary-item"><span>源桶</span><strong>{sourceCount ? `${sourceCount} 个已配置` : "尚未配置"}</strong></div>
+        <div className="workflow-summary-item"><span>最新扫描</span><strong>{scanSummary}</strong></div>
+        <div className="workflow-summary-item"><span>分流映射</span><strong>{mappingSummary}</strong></div>
+        <div className="workflow-summary-item"><span>运行状态</span><strong>{operationSummary}</strong></div>
+      </section>
+
+      <nav className="workflow-tabs" role="tablist" aria-label="R2 数据分流工作流" aria-orientation="horizontal" aria-busy={activeStage === null}>
+        {WORKFLOW_STAGES.map((stage) => {
+          const isSelected = activeStage === stage.id;
+          return (
+            <button
+              id={`stage-tab-${stage.id}`}
+              className="workflow-tab"
+              type="button"
+              role="tab"
+              aria-selected={isSelected}
+              aria-controls={`stage-panel-${stage.id}`}
+              tabIndex={isSelected ? 0 : -1}
+              disabled={activeStage === null}
+              key={stage.id}
+              onClick={() => selectStage(stage.id)}
+              onKeyDown={(event) => handleStageKeyDown(event, stage.id)}
+            >
+              <span className="workflow-tab-number" aria-hidden="true">{stage.number}</span>
+              <span>{stage.label}</span>
+            </button>
+          );
+        })}
+      </nav>
+
       {errorMessage && <p className="feedback feedback-error page-feedback" role="alert">{errorMessage}</p>}
       {message && <p className="feedback feedback-success page-feedback" role="status">{message}</p>}
-      <div className="dashboard-grid">
-        <section className="card workflow-card connection-card dashboard-span-full" aria-labelledby="source-connections-title">
-          <div className="card-header"><div><p className="section-kicker">01 / 连接</p><h2 id="source-connections-title">源桶连接</h2></div><span className={`connection-state ${connection.configured ? "is-configured" : ""}`}>{connection.configured ? "已保存" : "未保存"}</span></div>
-          <p className="card-description">选择源桶卡片查看连接详情。页面只显示 Secret 引用，真实凭据始终由部署环境注入。</p>
-          <ConnectionProfiles connections={connections} onApply={applyConnection} onRemove={(index) => setConnections((current) => current.filter((_, profileIndex) => profileIndex !== index))} />
-        </section>
-        <section className="card workflow-card connection-actions-card" aria-labelledby="connection-actions-title">
-          <div className="card-header"><div><p className="section-kicker">配置提交</p><h2 id="connection-actions-title">连接操作</h2></div></div>
-          <p className="card-description">“应用”只更新当前页面；保存后才会写入配置。测试始终使用最近一次已保存的连接。</p>
-          <form className="connection-actions-form" onSubmit={(event) => void saveConnection(event)}>
-            <div className="button-row">
-              <button className="primary-button" type="submit" aria-label="保存源桶连接配置">保存连接</button>
-              <button className="secondary-button" type="button" onClick={() => void testConnection()} disabled={!connection.configured} aria-label="测试已保存的源桶连接">测试连接</button>
-            </div>
-          </form>
-        </section>
-        <section className="card workflow-card"><div className="card-header"><div><p className="section-kicker">02 / 扫描</p><h2>识别每个源桶里的模型</h2></div></div><p className="card-description">保存连接后先点击“测试连接”，再点击“开始扫描”。扫描会检查 .tar.gz 归档内容以识别模型，不会修改源对象。</p><button className="primary-button wide-button" type="button" onClick={() => void startScan()} disabled={!connection.configured || scanActive}>{scanActive ? "正在扫描…" : "开始扫描"}</button>{scanJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">扫描进度</span><span className={`scan-state ${scanActive ? "is-running" : ""}`}>{getStatusLabel(scanJob.status)}</span></div>{scanJob.current_source_bucket && <p className="progress-caption">当前源桶：{scanJob.current_source_bucket}</p>}<div className="progress-meta"><strong>{scanProgress}%</strong><span>已处理 {scanJob.progress.processed} / {scanJob.progress.total || "等待统计"} 个对象</span></div><progress value={scanProgress} max="100">{scanProgress}%</progress><p className="progress-caption">已隔离 {scanJob.progress.failed} 个异常对象，其余对象会继续扫描。</p></div>}</section>
-      </div>
-      {scanReport && <ReportView report={scanReport} mappings={mappings} missingMappings={missingMappings} preflight={preflight} onMappingChange={updateMapping} onSaveMappings={() => void saveMappings()} onCheckTargets={() => void checkTargets()} />}
-      <section className="card incremental-card" aria-labelledby="continuous-routing-title"><div className="card-header"><div><p className="section-kicker">03 / 运行</p><h2 id="continuous-routing-title">持续分流</h2></div><label className="toggle-label"><input type="checkbox" checked={incremental?.continuous_enabled ?? false} onChange={(event) => void setContinuous(event.target.checked)} disabled={!incremental?.runtime_ready} /><span>自动分流</span></label></div><p className="card-description">运行密钥来自部署环境，不会在浏览器或数据卷保存。持续模式只读取新/变化归档并整包复制；历史回填需手动启动，列表和归档读取会产生 R2 请求成本。</p>{incremental && !incremental.runtime_ready && <p className="feedback feedback-error">{incremental.readiness_message}</p>}<div className="incremental-summary"><span>待处理 {incremental?.counts.queued ?? 0}</span><span>未映射 {incremental?.counts.unmapped ?? 0}</span><span>失败 {incremental?.counts.failed ?? 0}</span><span>冲突 {incremental?.counts.route_conflict ?? 0}</span><span>队列积压 {incremental?.queue_backlog_count ?? "未知"}</span></div><div className="button-row"><button className="secondary-button" type="button" onClick={() => void backfill("start")}>开始回填</button><button className="secondary-button" type="button" onClick={() => void backfill(incremental?.backfill.status === "paused" ? "resume" : "pause")}>{incremental?.backfill.status === "paused" ? "恢复回填" : "暂停回填"}</button><button className="text-button" type="button" onClick={() => void refreshIncremental()}>刷新状态</button></div><p className="report-footnote">回填状态：{incremental?.backfill.status ?? "idle"} · 已列举 {incremental?.backfill.total_seen ?? 0} 个对象 · 已分类 {incremental?.backfill.total_classified ?? 0} 个 · 对账：{incremental?.reconcile_last_run_at ?? "尚未运行"}</p><p className="report-footnote">队列拉取：{incremental?.queue_last_pull_at ?? "尚未运行"} · 队列确认：{incremental?.queue_last_ack_at ?? "尚未运行"}</p>{(incremental?.last_error || incremental?.backfill.error_code) && <p className="feedback feedback-error">最近错误：{incremental.last_error ?? incremental.backfill.error_code}</p>}</section>
-      {scanReport && <section className="card sync-card"><div className="card-header"><div><p className="section-kicker">04 / 运行</p><h2>开始同步</h2></div><span className="connection-state">不会覆盖已有对象</span></div><p className="card-description">程序会在 R2 内部复制完整对象，保留原 object key。目标桶已有同名对象时自动跳过。</p><button className="primary-button wide-button" type="button" onClick={() => void startSync()} disabled={!preflight?.success || syncActive}>{syncActive ? "正在同步…" : "开始同步"}</button>{!preflight?.success && <p className="action-note">请先保存完整映射，并点击“检查目标桶”。</p>}{syncJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">同步进度</span><span className={`scan-state ${syncActive ? "is-running" : ""}`}>{getStatusLabel(syncJob.status)}</span></div><div className="progress-meta"><strong>{syncProgress}%</strong><span>已处理 {syncJob.progress.processed} / {syncJob.progress.total || "等待统计"} 个复制动作</span></div><progress value={syncProgress} max="100">{syncProgress}%</progress>{syncJob.error && <p className="feedback feedback-error">{translateMessage(syncJob.error, "同步未能完成。")}</p>}</div>}{syncReport && <p className="report-footnote">复制 {syncReport.copied} 项 · 跳过 {syncReport.skipped} 项 · 失败 {syncReport.failed} 项</p>}</section>}
+
+      {activeStage === null ? (
+        <section className="workflow-workspace workflow-loading" aria-live="polite">正在载入工作流…</section>
+      ) : (
+        <>
+          <section
+            className="workflow-workspace"
+            id="stage-panel-connection"
+            role="tabpanel"
+            aria-labelledby="stage-tab-connection"
+            tabIndex={activeStage === "connection" ? 0 : -1}
+            hidden={activeStage !== "connection"}
+          >
+              <header className="workspace-header">
+                <div><p className="section-kicker">第 1 阶段</p><h1>源桶连接</h1><p>管理源桶、Endpoint 与部署 Secret 引用。真实凭据不会在页面中显示。</p></div>
+                <span className={`connection-state ${connection.configured ? "is-configured" : ""}`}>{connection.configured ? "配置已保存" : "尚未保存"}</span>
+              </header>
+              {!connection.configured && <p className="stage-notice is-warning">先添加并保存至少一个完整连接；测试连接使用最近一次已保存的配置。</p>}
+              <ConnectionProfiles connections={connections} onApply={applyConnection} onRemove={(index) => setConnections((current) => current.filter((_, profileIndex) => profileIndex !== index))} />
+              <form className="workspace-toolbar" onSubmit={(event) => void saveConnection(event)}>
+                <p>编辑器中的“应用”只更新当前页面，点击保存后才会持久化。</p>
+                <div className="button-row">
+                  <button className="primary-button" type="submit">保存连接</button>
+                  <button className="secondary-button" type="button" onClick={() => void testConnection()} disabled={!connection.configured}>测试连接</button>
+                </div>
+              </form>
+              <StageActions next="scan" onSelect={selectStage} />
+          </section>
+
+          <section
+            className="workflow-workspace"
+            id="stage-panel-scan"
+            role="tabpanel"
+            aria-labelledby="stage-tab-scan"
+            tabIndex={activeStage === "scan" ? 0 : -1}
+            hidden={activeStage !== "scan"}
+          >
+              <header className="workspace-header">
+                <div><p className="section-kicker">第 2 阶段</p><h1>扫描数据</h1><p>手动读取 .tar.gz 归档并识别模型；扫描过程只读，不修改源对象。</p></div>
+                {scanJob && <span className={`scan-state ${scanActive ? "is-running" : ""}`}>{getStatusLabel(scanJob.status)}</span>}
+              </header>
+              {!connection.configured && <p className="stage-notice is-warning">尚无已保存连接。仍可浏览此阶段，配置完成后才能启动扫描。</p>}
+              <div className="scan-control-row">
+                <div><strong>{scanReport ? `报告生成于 ${scanReport.generated_at}` : "尚无可用扫描报告"}</strong><span>{scanReport ? `${scanReport.source_buckets.length} 个源桶 · ${scanReport.object_count} 个对象` : "启动扫描后，进度与最新结果会显示在这里。"}</span></div>
+                <button className="primary-button" type="button" onClick={() => void startScan()} disabled={!connection.configured || scanActive}>{scanActive ? "正在扫描…" : scanReport ? "重新扫描" : "开始扫描"}</button>
+              </div>
+              {scanJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">扫描进度</span><span className={`scan-state ${scanActive ? "is-running" : ""}`}>{getStatusLabel(scanJob.status)}</span></div>{scanJob.current_source_bucket && <p className="progress-caption">当前源桶：{scanJob.current_source_bucket}</p>}<div className="progress-meta"><strong>{scanProgress}%</strong><span>已处理 {scanJob.progress.processed} / {scanJob.progress.total || "等待统计"} 个对象</span></div><progress value={scanProgress} max="100">{scanProgress}%</progress><p className="progress-caption">已隔离 {scanJob.progress.failed} 个异常对象，其余对象会继续扫描。</p>{scanJob.error && <p className="feedback feedback-error">{translateMessage(scanJob.error, "扫描未能完成。")}</p>}</div>}
+              {scanReport && <ScanReportView report={scanReport} />}
+              <StageActions previous="connection" next="mapping" onSelect={selectStage} />
+          </section>
+
+          <section
+            className="workflow-workspace"
+            id="stage-panel-mapping"
+            role="tabpanel"
+            aria-labelledby="stage-tab-mapping"
+            tabIndex={activeStage === "mapping" ? 0 : -1}
+            hidden={activeStage !== "mapping"}
+          >
+              <header className="workspace-header">
+                <div><p className="section-kicker">第 3 阶段</p><h1>分流映射</h1><p>为扫描识别出的每个模型指定目标桶；未映射模型会保留在待处理状态。</p></div>
+                {scanReport && <span className={`connection-state ${missingMappings === 0 ? "is-configured" : ""}`}>{mappingSummary}</span>}
+              </header>
+              {scanReport ? (
+                <MappingView report={scanReport} mappings={mappings} missingMappings={missingMappings} onMappingChange={updateMapping} onSaveMappings={() => void saveMappings()} />
+              ) : (
+                <div className="stage-empty"><strong>需要扫描报告</strong><p>先到“扫描数据”运行一次扫描，再返回配置模型到目标桶的映射。</p><button className="secondary-button" type="button" onClick={() => selectStage("scan")}>前往扫描数据</button></div>
+              )}
+              <StageActions previous="scan" next="operations" onSelect={selectStage} />
+          </section>
+
+          <section
+            className="workflow-workspace"
+            id="stage-panel-operations"
+            role="tabpanel"
+            aria-labelledby="stage-tab-operations"
+            tabIndex={activeStage === "operations" ? 0 : -1}
+            hidden={activeStage !== "operations"}
+          >
+              <header className="workspace-header">
+                <div><p className="section-kicker">第 4 阶段</p><h1>同步与持续运行</h1><p>执行一次性同步，或管理新对象分流、历史回填和状态对账。</p></div>
+                <span className={`connection-state ${incremental?.continuous_enabled ? "is-configured" : ""}`}>{operationSummary}</span>
+              </header>
+
+              <div className="operations-layout">
+                <section className="operation-section" aria-labelledby="manual-sync-title">
+                  <div className="operation-heading"><div><p className="section-kicker">手动同步</p><h2 id="manual-sync-title">预检与复制</h2></div><span>不覆盖已有对象</span></div>
+                  <p className="operation-description">检查目标桶权限后，在 R2 内部复制完整对象并保留原 object key。</p>
+                  {!scanReport && <p className="stage-notice is-warning">没有可用于同步的扫描报告，请先完成扫描。</p>}
+                  {scanReport && missingMappings > 0 && <p className="stage-notice is-warning">还有 {missingMappings} 个模型未映射，请先在第 3 阶段补全并保存。</p>}
+                  <div className="button-row">
+                    <button className="secondary-button" type="button" onClick={() => void checkTargets()} disabled={!scanReport || !mappings.length || missingMappings > 0}>检查目标桶</button>
+                    <button className="primary-button" type="button" onClick={() => void startSync()} disabled={!preflight?.success || syncActive}>{syncActive ? "正在同步…" : "开始同步"}</button>
+                  </div>
+                  {preflight && <div className="preflight-list">{preflight.targets.map((target) => <div className="preflight-row" key={target.target_bucket}><span className={`status-dot ${target.accessible ? "is-success" : "is-error"}`} aria-hidden="true" /><span>{target.target_bucket}</span><span>{target.accessible ? "可访问" : "无法访问"}</span></div>)}</div>}
+                  {syncJob && <div className="progress-panel" aria-live="polite"><div className="progress-heading"><span className="section-kicker">同步进度</span><span className={`scan-state ${syncActive ? "is-running" : ""}`}>{getStatusLabel(syncJob.status)}</span></div><div className="progress-meta"><strong>{syncProgress}%</strong><span>已处理 {syncJob.progress.processed} / {syncJob.progress.total || "等待统计"} 个复制动作</span></div><progress value={syncProgress} max="100">{syncProgress}%</progress>{syncJob.error && <p className="feedback feedback-error">{translateMessage(syncJob.error, "同步未能完成。")}</p>}</div>}
+                  {syncReport && <p className="report-footnote">共 {syncReport.total} 项 · 复制 {syncReport.copied} 项 · 跳过 {syncReport.skipped} 项 · 失败 {syncReport.failed} 项</p>}
+                </section>
+
+                <section className="operation-section" aria-labelledby="continuous-routing-title">
+                  <div className="operation-heading"><div><p className="section-kicker">增量处理</p><h2 id="continuous-routing-title">持续分流</h2></div><label className="toggle-label"><input type="checkbox" checked={incremental?.continuous_enabled ?? false} onChange={(event) => void setContinuous(event.target.checked)} disabled={!incremental?.runtime_ready} /><span>自动分流</span></label></div>
+                  <p className="operation-description">只读取新或变化的归档并按已保存映射复制；运行密钥始终来自部署环境。</p>
+                  {incremental && !incremental.runtime_ready && <p className="stage-notice is-warning">{incremental.readiness_message}</p>}
+                  <div className="incremental-summary"><span>待处理 <strong>{incremental?.counts.queued ?? 0}</strong></span><span>未映射 <strong>{incremental?.counts.unmapped ?? 0}</strong></span><span>失败 <strong>{incremental?.counts.failed ?? 0}</strong></span><span>冲突 <strong>{incremental?.counts.route_conflict ?? 0}</strong></span><span>队列积压 <strong>{incremental?.queue_backlog_count ?? "未知"}</strong></span></div>
+                </section>
+
+                <section className="operation-section operation-section-wide" aria-labelledby="backfill-title">
+                  <div className="operation-heading"><div><p className="section-kicker">历史与对账</p><h2 id="backfill-title">回填、队列与对账</h2></div><button className="text-button" type="button" onClick={() => void refreshIncremental()}>刷新状态</button></div>
+                  <p className="operation-description">历史回填需明确启动，可暂停和恢复；刷新会重新读取队列及最近对账状态。</p>
+                  <div className="backfill-controls">
+                    <div className="button-row"><button className="secondary-button" type="button" onClick={() => void backfill("start")}>开始回填</button><button className="secondary-button" type="button" onClick={() => void backfill(incremental?.backfill.status === "paused" ? "resume" : "pause")}>{incremental?.backfill.status === "paused" ? "恢复回填" : "暂停回填"}</button></div>
+                    <div className="backfill-status"><span>回填状态 <strong>{incremental?.backfill.status ?? "idle"}</strong></span><span>已列举 <strong>{incremental?.backfill.total_seen ?? 0}</strong></span><span>已分类 <strong>{incremental?.backfill.total_classified ?? 0}</strong></span></div>
+                  </div>
+                  <dl className="runtime-timestamps"><div><dt>最近对账</dt><dd>{incremental?.reconcile_last_run_at ?? "尚未运行"}</dd></div><div><dt>队列拉取</dt><dd>{incremental?.queue_last_pull_at ?? "尚未运行"}</dd></div><div><dt>队列确认</dt><dd>{incremental?.queue_last_ack_at ?? "尚未运行"}</dd></div></dl>
+                  {(incremental?.last_error || incremental?.backfill.error_code) && <p className="feedback feedback-error">最近错误：{incremental.last_error ?? incremental.backfill.error_code}</p>}
+                </section>
+              </div>
+              <StageActions previous="mapping" onSelect={selectStage} />
+          </section>
+        </>
+      )}
     </main>
   );
 }

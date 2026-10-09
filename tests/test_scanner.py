@@ -90,15 +90,30 @@ async def test_network_read_error_retries_twice_then_fails() -> None:
 
 
 def test_report_preserves_multi_model_associations_without_duplicates() -> None:
-    source_objects = [SourceObject(key="b.tar.gz", size=20), SourceObject(key="a.tar.gz", size=10), SourceObject(key="notes.txt", size=5)]
+    source_objects = [
+        SourceObject(key="b.tar.gz", size=20),
+        SourceObject(key="a.tar.gz", size=10, etag="etag-a", last_modified="timestamp"),
+        SourceObject(key="notes.txt", size=5),
+    ]
     outcomes = {"a.tar.gz": ObjectScanOutcome("matched", ("model-b", "model-a", "model-a")), "b.tar.gz": ObjectScanOutcome("unmatched"), "notes.txt": ObjectScanOutcome("non_archive")}
     bucket_report = build_source_bucket_report("source", source_objects, outcomes)
     report = build_scan_report("job-id", "timestamp", [bucket_report])
     assert report["source_buckets"][0]["models"]["model-a"]["object_count"] == 1
     assert report["source_buckets"][0]["models"]["model-a"]["total_bytes"] == 10
-    assert report["source_buckets"][0]["models"]["model-b"]["objects"] == [{"key": "a.tar.gz", "size": 10}]
-    assert report["source_buckets"][0]["unmatched_objects"] == [{"key": "b.tar.gz", "size": 20}]
-    assert report["source_buckets"][0]["non_archive_objects"] == [{"key": "notes.txt", "size": 5}]
+    assert report["source_buckets"][0]["models"]["model-b"]["objects"] == [
+        {
+            "key": "a.tar.gz",
+            "size": 10,
+            "etag": "etag-a",
+            "last_modified": "timestamp",
+        }
+    ]
+    assert report["source_buckets"][0]["unmatched_objects"] == [
+        {"key": "b.tar.gz", "size": 20, "etag": None, "last_modified": None}
+    ]
+    assert report["source_buckets"][0]["non_archive_objects"] == [
+        {"key": "notes.txt", "size": 5, "etag": None, "last_modified": None}
+    ]
 
 
 def test_multi_source_report_keeps_same_model_in_separate_buckets() -> None:
@@ -121,8 +136,18 @@ def test_multi_source_report_keeps_same_model_in_separate_buckets() -> None:
 
     assert [bucket["source_bucket"] for bucket in report["source_buckets"]] == ["招 2", "招 3"]
     assert report["source_buckets"][0]["models"]["sol"]["objects"] == [
-        {"key": "first.tar.gz", "size": 10}
+        {
+            "key": "first.tar.gz",
+            "size": 10,
+            "etag": None,
+            "last_modified": None,
+        }
     ]
     assert report["source_buckets"][1]["models"]["sol"]["objects"] == [
-        {"key": "second.tar.gz", "size": 20}
+        {
+            "key": "second.tar.gz",
+            "size": 20,
+            "etag": None,
+            "last_modified": None,
+        }
     ]

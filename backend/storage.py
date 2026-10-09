@@ -211,7 +211,13 @@ class IncrementalStore:
                     (event.get("bucket", ""), source_object.key),
                 ).fetchone()
                 return (int(current["id"]) if current else 0, False)
-            object_id = self._upsert_object(connection, str(event.get("bucket", "")), source_object, now, "event")
+            object_id, _ = self._upsert_object(
+                connection,
+                str(event.get("bucket", "")),
+                source_object,
+                now,
+                "event",
+            )
             connection.execute(
                 "INSERT INTO queue_events(event_key,account,source_bucket,object_key,action,payload_json,received_at,accepted_at) VALUES(?,?,?,?,?,?,?,?)",
                 (

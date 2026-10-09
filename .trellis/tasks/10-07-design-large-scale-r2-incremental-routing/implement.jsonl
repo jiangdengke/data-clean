@@ -1,0 +1,8 @@
+{"file":".trellis/spec/backend/index.md","reason":"后端包规范和适用指南索引。"}
+{"file":".trellis/spec/backend/type-safety.md","reason":"后端数据模型和类型约定。"}
+{"file":".trellis/spec/backend/quality.md","reason":"后端验证和质量门禁。"}
+{"file":".trellis/spec/backend/performance.md","reason":"外部 API、后台任务和性能约定。"}
+{"file":".trellis/spec/frontend/index.md","reason":"如果需要调整持续处理状态展示时使用前端规范。"}
+{"file":".trellis/spec/guides/index.md","reason":"跨层设计和实现前检查指南。"}
+{"file":".trellis/tasks/10-07-design-large-scale-r2-incremental-routing/research/r2-object-events.md","reason":"R2 事件通知、Queue 投递和 HTTP pull 研究。"}
+{"file":".trellis/tasks/10-07-design-large-scale-r2-incremental-routing/research/incremental-indexing.md","reason":"大规模增量索引、对象指纹和历史回填研究。"}

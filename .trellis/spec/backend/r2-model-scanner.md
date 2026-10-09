@@ -360,3 +360,85 @@ return "copied"
 ```
 
 Only the explicit administrator sync worker or enabled incremental route worker may perform this existing server-side `CopyObject` path, after source freshness and mapping checks. The specification describes local mocks and durable contracts; it does not claim live provider validation.
+
+## 10. External single-object transfer adapter
+
+### Scope/Trigger
+
+Use the shared adapter boundary only for one whole-object, mapped sync action. `boto3` is the default; `rclone` is optional and is enabled only by `R2_TRANSFER_ADAPTER=rclone`. The adapter does not own Queue ingestion, archive classification, SQLite state, mappings, or routing policy.
+
+### Signatures
+
+```python
+@dataclass(frozen=True)
+class TransferRequest:
+    source_bucket: str; source_key: str
+    target_bucket: str; target_key: str; expected_size: int
+
+class ObjectTransferAdapter(Protocol):
+    def transfer_object(
+        self, request: TransferRequest,
+        cancellation_event: threading.Event | None = None,
+    ) -> TransferOutcome: ...
+
+execute_sync_action(client: R2Client, action: SyncAction,
+                    cancellation_event: threading.Event | None = None) -> SyncResult
+execute_sync_action_async(client: R2Client, action: SyncAction) -> SyncResult
+```
+
+`Boto3TransferAdapter` uses provider-side `CopyObject`. `RcloneTransferAdapter` uses configless, shell-free, same-account `copyto`.
+
+### Contracts
+
+- `execute_sync_action` HEADs the source first, rejects a changed size/expected ETag, then performs target preflight; an existing target is skipped without copying.
+- A transfer is a copy only: no `sync`, `move`, `delete`, `mkdir`, bucket creation, source deletion, or overwrite. HEAD/copy races remain possible.
+- Rclone credentials exist only in its child environment; `/dev/null` is the config file and credentials never appear in argv, reports, logs, or SQLite. It is fail-closed to one Cloudflare R2 account endpoint and objects `<= 5 GiB`.
+- `RCLONE_BINARY_PATH`, `RCLONE_TRANSFER_TIMEOUT_SECONDS`, `RCLONE_OUTPUT_LIMIT_BYTES`, and `RCLONE_LOW_LEVEL_RETRIES` configure the optional adapter. Boto3 remains production default.
+- Rclone exit 0 is not proof of copying: classify bounded JSON output, then `Boto3R2Client` HEADs the target size for adapters with `requires_target_verification`.
+- `execute_sync_action_async` propagates cancellation to the blocking adapter; rclone timeout/cancellation stops the process group and drains output. Queue acknowledgement, classifier work, SQLite durability, and mapping decisions stay application-owned.
+
+Current Python use:
+
+```python
+result = execute_sync_action(client, action, cancellation_event)
+# result["status"] is "copied" or "skipped"; exceptions are safe, normalized errors.
+```
+
+### Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| Missing/relative binary, missing credentials, invalid timeout/output/retry setting | terminal `TransferConfigurationError` / binary-unavailable state |
+| Non-R2 endpoint, different-account source profile, invalid bucket/key, or size `> 5 GiB` | terminal `UnsupportedTransferTopologyError`; do not spawn rclone |
+| Source HEAD differs from the action | terminal source-change conflict; do not preflight/copy |
+| Target exists or rclone reports an ignored existing target | visible skipped/conflict; never overwrite |
+| Post-copy target size differs | terminal `TargetVerificationError` conflict |
+| Provider/process start or transient transfer failure | bounded retryable `TransferError` / `copy_failed` |
+| Timeout or cancellation | stop process group, clean up, and surface normalized timeout/cancel state |
+
+### Good/Base/Bad Cases
+
+- **Good:** mapped action, current source, absent target, valid R2 topology; Boto3 copies or rclone reports copied and target size matches.
+- **Base:** exit 0 with `--ignore-existing`; classify as skipped and record a conflict after target preflight/verification.
+- **Bad:** pass secrets on the command line, use a persistent rclone config, or use `sync`/`move`/`delete`; reject before transfer.
+
+### Tests Required
+
+Keep these contracts covered by `tests/test_transfer.py`, `tests/test_sync.py`, and `tests/test_incremental_service.py`: Boto3 default; configless child-env-only secrets; shell-free `copyto`; forbidden commands; output-cap and exit-zero skip classification; source/target HEAD checks; 5 GiB and topology fail-closed validation; bounded retry versus terminal error codes; timeout/cancellation process-group cleanup; async cancellation; and no secret/provider-detail leakage.
+
+### Wrong vs Correct
+
+**Wrong**
+
+```python
+subprocess.run(f"rclone sync {src} {dst} --s3-access-key {secret}", shell=True)
+```
+
+**Correct**
+
+```python
+# source HEAD and target preflight happen in execute_sync_action
+outcome = client.transfer_object(TransferRequest(src_bucket, key, dst_bucket, key, size))
+```
+
+The correct path uses the selected adapter, child-only credentials, no-overwrite checks, bounded output, and post-copy verification where required.

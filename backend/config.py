@@ -5,6 +5,14 @@ import os
 from pathlib import Path
 import re
 
+from .transfer import (
+    MAX_RCLONE_LOW_LEVEL_RETRIES,
+    MAX_RCLONE_OUTPUT_LIMIT_BYTES,
+    MAX_RCLONE_TRANSFER_TIMEOUT_SECONDS,
+    MIN_RCLONE_OUTPUT_LIMIT_BYTES,
+    is_supported_r2_endpoint,
+)
+
 
 def parse_boolean_environment_value(value: str, variable_name: str) -> bool:
     normalized_value = value.strip().lower()
@@ -15,14 +23,33 @@ def parse_boolean_environment_value(value: str, variable_name: str) -> bool:
     raise RuntimeError(f"{variable_name} must be a boolean value")
 
 
-def parse_integer_environment_value(value: str, variable_name: str, minimum: int = 0) -> int:
+def parse_integer_environment_value(
+    value: str,
+    variable_name: str,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
     try:
         parsed = int(value)
     except ValueError as error:
         raise RuntimeError(f"{variable_name} must be an integer") from error
     if parsed < minimum:
         raise RuntimeError(f"{variable_name} must be at least {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise RuntimeError(f"{variable_name} must be at most {maximum}")
     return parsed
+
+
+def parse_choice_environment_value(
+    value: str,
+    variable_name: str,
+    allowed_values: frozenset[str],
+) -> str:
+    normalized_value = value.strip().lower()
+    if normalized_value not in allowed_values:
+        choices = ", ".join(sorted(allowed_values))
+        raise RuntimeError(f"{variable_name} must be one of: {choices}")
+    return normalized_value
 
 
 @dataclass(frozen=True)
@@ -54,6 +81,11 @@ class AppSettings:
     reconcile_interval_seconds: int = 3600
     worker_concurrency: int = 2
     backfill_page_size: int = 1000
+    transfer_adapter: str = "boto3"
+    rclone_binary_path: str = "/usr/local/bin/rclone"
+    rclone_transfer_timeout_seconds: int = 3600
+    rclone_output_limit_bytes: int = 64 * 1024
+    rclone_low_level_retries: int = 3
 
     @classmethod
     def from_environment(cls) -> "AppSettings":
@@ -65,6 +97,16 @@ class AppSettings:
         cookie_secure = parse_boolean_environment_value(
             os.environ.get("COOKIE_SECURE", "false"), "COOKIE_SECURE"
         )
+        transfer_adapter = parse_choice_environment_value(
+            os.environ.get("R2_TRANSFER_ADAPTER", "boto3"),
+            "R2_TRANSFER_ADAPTER",
+            frozenset({"boto3", "rclone"}),
+        )
+        rclone_binary_path = os.environ.get(
+            "RCLONE_BINARY_PATH", "/usr/local/bin/rclone"
+        ).strip()
+        if transfer_adapter == "rclone" and not Path(rclone_binary_path).is_absolute():
+            raise RuntimeError("RCLONE_BINARY_PATH must be absolute in rclone mode")
         return cls(
             admin_password=admin_password,
             data_directory=data_directory,
@@ -108,6 +150,26 @@ class AppSettings:
             backfill_page_size=parse_integer_environment_value(
                 os.environ.get("BACKFILL_PAGE_SIZE", "1000"), "BACKFILL_PAGE_SIZE", 1
             ),
+            transfer_adapter=transfer_adapter,
+            rclone_binary_path=rclone_binary_path,
+            rclone_transfer_timeout_seconds=parse_integer_environment_value(
+                os.environ.get("RCLONE_TRANSFER_TIMEOUT_SECONDS", "3600"),
+                "RCLONE_TRANSFER_TIMEOUT_SECONDS",
+                1,
+                MAX_RCLONE_TRANSFER_TIMEOUT_SECONDS,
+            ),
+            rclone_output_limit_bytes=parse_integer_environment_value(
+                os.environ.get("RCLONE_OUTPUT_LIMIT_BYTES", str(64 * 1024)),
+                "RCLONE_OUTPUT_LIMIT_BYTES",
+                MIN_RCLONE_OUTPUT_LIMIT_BYTES,
+                MAX_RCLONE_OUTPUT_LIMIT_BYTES,
+            ),
+            rclone_low_level_retries=parse_integer_environment_value(
+                os.environ.get("RCLONE_LOW_LEVEL_RETRIES", "3"),
+                "RCLONE_LOW_LEVEL_RETRIES",
+                0,
+                MAX_RCLONE_LOW_LEVEL_RETRIES,
+            ),
         )
 
     @staticmethod
@@ -141,6 +203,24 @@ class AppSettings:
     def bucket_runtime_ready(self, credential_refs: tuple[str, ...]) -> bool:
         return bool(credential_refs) and all(self.credentials_ready_for(ref) for ref in credential_refs)
 
+    @property
+    def transfer_adapter_ready(self) -> bool:
+        if self.transfer_adapter == "boto3":
+            return True
+        binary_path = Path(self.rclone_binary_path)
+        return binary_path.is_absolute() and binary_path.is_file() and os.access(binary_path, os.X_OK)
+
+    @property
+    def transfer_readiness_message(self) -> str:
+        if self.transfer_adapter_ready:
+            return "传输适配器已就绪"
+        return "RCLONE_BINARY_PATH 必须指向可执行的 rclone 文件"
+
+    def transfer_topology_ready(self, endpoints: tuple[str, ...]) -> bool:
+        if self.transfer_adapter == "boto3":
+            return True
+        return bool(endpoints) and all(is_supported_r2_endpoint(endpoint) for endpoint in endpoints)
+
     def readiness_message_for(
         self,
         credential_refs: tuple[str, ...],
@@ -148,10 +228,14 @@ class AppSettings:
     ) -> str:
         """Describe missing non-secret deployment prerequisites for saved profiles."""
         missing: list[str] = []
+        if not self.transfer_adapter_ready:
+            missing.append("RCLONE_BINARY_PATH")
         if endpoints and any(not endpoint.strip() for endpoint in endpoints):
             missing.append("R2_ENDPOINT")
         if not endpoints:
             missing.append("R2_ENDPOINT")
+        elif not self.transfer_topology_ready(endpoints):
+            missing.append("R2_ENDPOINT_RCLONE_TOPOLOGY")
         for credential_ref in dict.fromkeys(credential_refs):
             if self.credentials_ready_for(credential_ref):
                 continue
@@ -187,7 +271,12 @@ class AppSettings:
 
     @property
     def runtime_ready(self) -> bool:
-        return self.r2_credentials_ready and self.queue_credentials_ready
+        return (
+            self.r2_credentials_ready
+            and self.queue_credentials_ready
+            and self.transfer_adapter_ready
+            and self.transfer_topology_ready((self.r2_endpoint,))
+        )
 
     @property
     def readiness_message(self) -> str:
@@ -204,4 +293,8 @@ class AppSettings:
             missing.append("CLOUDFLARE_QUEUE_ID")
         if not self.cloudflare_api_token:
             missing.append("CLOUDFLARE_API_TOKEN")
+        if not self.transfer_adapter_ready:
+            missing.append("RCLONE_BINARY_PATH")
+        if self.r2_endpoint and not self.transfer_topology_ready((self.r2_endpoint,)):
+            missing.append("R2_ENDPOINT_RCLONE_TOPOLOGY")
         return "运行凭据已就绪" if not missing else f"缺少部署环境配置：{', '.join(missing)}"

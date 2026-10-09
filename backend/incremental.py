@@ -12,7 +12,14 @@ from .queue_client import QueueClient, sanitize_r2_event, validate_r2_event
 from .r2_client import R2Client, create_r2_client
 from .scanner import scan_object_with_retries
 from .storage import IncrementalStore, JobStorage, current_timestamp
-from .sync import SyncAction, execute_sync_action
+from .sync import SyncAction, execute_sync_action_async
+from .transfer import (
+    SourceChangedBeforeTransferError,
+    TargetVerificationError,
+    TransferBinaryMissingError,
+    TransferConfigurationError,
+    UnsupportedTransferTopologyError,
+)
 
 
 def _now() -> str:
@@ -261,12 +268,35 @@ class IncrementalService:
                 target_bucket=str(task["target_bucket"]),
                 object_key=str(task["object_key"]),
                 size=stored_size,
+                expected_etag=(
+                    str(object_row["etag"])
+                    if object_row.get("etag") is not None
+                    else None
+                ),
             )
-            result = await asyncio.to_thread(execute_sync_action, client, action)
+            result = await execute_sync_action_async(client, action)
             if result["status"] == "copied":
                 self.store.finish_route(int(task["id"]), "copied")
             else:
                 self.store.finish_route(int(task["id"]), "conflict", "target_exists")
+        except SourceChangedBeforeTransferError:
+            self.store.finish_route(int(task["id"]), "superseded", "source_changed")
+        except TargetVerificationError:
+            self.store.finish_route(
+                int(task["id"]), "conflict", "target_verification_failed"
+            )
+        except UnsupportedTransferTopologyError:
+            self.store.finish_route(
+                int(task["id"]), "failed", "unsupported_transfer_topology"
+            )
+        except TransferBinaryMissingError:
+            self.store.finish_route(
+                int(task["id"]), "failed", "transfer_binary_unavailable"
+            )
+        except TransferConfigurationError:
+            self.store.finish_route(
+                int(task["id"]), "failed", "transfer_configuration_invalid"
+            )
         except Exception:
             self.store.finish_route(int(task["id"]), "retry_wait", "copy_failed")
 
@@ -414,9 +444,17 @@ class IncrementalService:
 
     def _runtime_ready(self) -> bool:
         profiles = self.storage.get_connection_profiles()
-        return bool(profiles) and all(
-            profile.endpoint.strip() and self.settings.credentials_ready_for(profile.credential_ref)
-            for profile in profiles
+        return (
+            self.settings.transfer_adapter_ready
+            and self.settings.transfer_topology_ready(
+                tuple(profile.endpoint for profile in profiles)
+            )
+            and bool(profiles)
+            and all(
+                profile.endpoint.strip()
+                and self.settings.credentials_ready_for(profile.credential_ref)
+                for profile in profiles
+            )
         )
 
     def _source_buckets(self) -> tuple[str, ...]:

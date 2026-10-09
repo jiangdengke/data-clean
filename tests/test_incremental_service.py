@@ -8,7 +8,13 @@ import pytest
 from backend.config import AppSettings
 from backend.incremental import IncrementalService
 from backend.models import BucketModelMapping, SourceObject
+from backend.queue_client import QueueMessage
 from backend.storage import JobStorage
+from backend.transfer import (
+    TransferError,
+    TransferOutcome,
+    UnsupportedTransferTopologyError,
+)
 
 
 @pytest.mark.asyncio
@@ -29,6 +35,114 @@ async def test_route_source_change_is_superseded_without_copy(tmp_path: Path) ->
     assert route["state"] == "superseded"
     assert route["error_code"] == "source_changed"
     assert client.copies == []
+
+
+@pytest.mark.asyncio
+async def test_route_success_uses_shared_transfer_boundary(tmp_path: Path) -> None:
+    settings = make_ready_settings(tmp_path)
+    storage = JobStorage(tmp_path)
+    service = IncrementalService(settings, storage, lambda: None)
+    source = SourceObject("item.tar.gz", 10, "etag")
+    object_id, _ = storage.incremental.upsert_object("source", source)
+    assert storage.incremental.enqueue_route(
+        object_id, "source", "item.tar.gz", "target", ["model"]
+    )
+    task = storage.incremental.claim_next_route()
+    assert task is not None
+
+    client = RoutingClient(source)
+    await service.process_route(task, client)
+
+    with storage.incremental._connect() as connection:
+        route = connection.execute(
+            "SELECT state,error_code FROM routing_tasks WHERE id=?", (task["id"],)
+        ).fetchone()
+    assert route["state"] == "copied"
+    assert route["error_code"] is None
+    assert client.copies == [("source", "item.tar.gz")]
+
+
+@pytest.mark.asyncio
+async def test_route_exit_zero_skip_is_recorded_as_conflict(tmp_path: Path) -> None:
+    settings = make_ready_settings(tmp_path)
+    storage = JobStorage(tmp_path)
+    service = IncrementalService(settings, storage, lambda: None)
+    source = SourceObject("item.tar.gz", 10, "etag")
+    object_id, _ = storage.incremental.upsert_object("source", source)
+    assert storage.incremental.enqueue_route(
+        object_id, "source", "item.tar.gz", "target", ["model"]
+    )
+    task = storage.incremental.claim_next_route()
+    assert task is not None
+
+    client = RoutingClient(source, outcome=TransferOutcome.SKIPPED)
+    await service.process_route(task, client)
+
+    with storage.incremental._connect() as connection:
+        route = connection.execute(
+            "SELECT state,error_code FROM routing_tasks WHERE id=?", (task["id"],)
+        ).fetchone()
+    assert route["state"] == "conflict"
+    assert route["error_code"] == "target_exists"
+
+
+@pytest.mark.asyncio
+async def test_route_nonretryable_adapter_failure_is_terminal_and_sanitized(
+    tmp_path: Path,
+) -> None:
+    settings = make_ready_settings(tmp_path)
+    storage = JobStorage(tmp_path)
+    service = IncrementalService(settings, storage, lambda: None)
+    source = SourceObject("item.tar.gz", 10, "etag")
+    object_id, _ = storage.incremental.upsert_object("source", source)
+    assert storage.incremental.enqueue_route(
+        object_id, "source", "item.tar.gz", "target", ["model"]
+    )
+    task = storage.incremental.claim_next_route()
+    assert task is not None
+
+    client = RoutingClient(
+        source,
+        error=UnsupportedTransferTopologyError("private-secret provider detail"),
+    )
+    await service.process_route(task, client)
+
+    with storage.incremental._connect() as connection:
+        route = connection.execute(
+            "SELECT state,error_code,next_retry_at FROM routing_tasks WHERE id=?",
+            (task["id"],),
+        ).fetchone()
+    assert dict(route) == {
+        "state": "failed",
+        "error_code": "unsupported_transfer_topology",
+        "next_retry_at": None,
+    }
+    assert b"private-secret" not in storage.incremental.database_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_route_transient_transfer_failure_is_retried(tmp_path: Path) -> None:
+    settings = make_ready_settings(tmp_path)
+    storage = JobStorage(tmp_path)
+    service = IncrementalService(settings, storage, lambda: None)
+    source = SourceObject("item.tar.gz", 10, "etag")
+    object_id, _ = storage.incremental.upsert_object("source", source)
+    assert storage.incremental.enqueue_route(
+        object_id, "source", "item.tar.gz", "target", ["model"]
+    )
+    task = storage.incremental.claim_next_route()
+    assert task is not None
+
+    await service.process_route(task, RoutingClient(source, error=TransferError("temporary")))
+
+    with storage.incremental._connect() as connection:
+        route = connection.execute(
+            "SELECT state,error_code,next_retry_at FROM routing_tasks WHERE id=?",
+            (task["id"],),
+        ).fetchone()
+    assert route["state"] == "retry_wait"
+    assert route["error_code"] == "copy_failed"
+    assert route["next_retry_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -68,8 +182,15 @@ async def test_continuous_toggle_starts_and_stops_consumers_independently_of_bac
 
 
 class RoutingClient:
-    def __init__(self, current: SourceObject) -> None:
+    def __init__(
+        self,
+        current: SourceObject,
+        outcome: TransferOutcome = TransferOutcome.COPIED,
+        error: Exception | None = None,
+    ) -> None:
         self.current = current
+        self.outcome = outcome
+        self.error = error
         self.copies: list[tuple[str, str]] = []
 
     def head_object(self, bucket: str, key: str) -> SourceObject:
@@ -78,8 +199,15 @@ class RoutingClient:
     def object_exists(self, bucket: str, key: str) -> bool:
         return False
 
-    def copy_object(self, source_bucket: str, source_key: str, target_bucket: str, target_key: str) -> None:
-        self.copies.append((source_bucket, source_key))
+    def transfer_object(
+        self,
+        request,
+        cancellation_event=None,
+    ) -> TransferOutcome:
+        self.copies.append((request.source_bucket, request.source_key))
+        if self.error is not None:
+            raise self.error
+        return self.outcome
 
 
 class BackfillClient:
@@ -247,6 +375,53 @@ async def test_mapping_save_stays_paused_until_continuous_mode_is_enabled(tmp_pa
     await service.apply_continuous_state()
     assert storage.incremental.counts().get("route_pending", 0) == 1
     await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_queue_ack_happens_after_durable_event_acceptance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = make_ready_settings(tmp_path)
+    storage = JobStorage(tmp_path)
+    storage.save_connection("https://r2.example", ("source",))
+    service = IncrementalService(settings, storage, lambda: None)
+    acknowledged: list[str] = []
+
+    class FakeQueue:
+        def __init__(self, account_id: str, queue_id: str, api_token: str) -> None:
+            self.last_backlog_count = 1
+
+        def pull(self, visibility_timeout_ms: int, batch_size: int) -> list[QueueMessage]:
+            return [
+                QueueMessage(
+                    "lease-1",
+                    {
+                        "account": "account",
+                        "action": "PutObject",
+                        "bucket": "source",
+                        "object": {"key": "item.tar.gz", "size": 10, "eTag": "etag"},
+                    },
+                )
+            ]
+
+        def ack(self, lease_ids: list[str]) -> None:
+            current = storage.incremental.get_current_object("source", "item.tar.gz")
+            assert current is not None
+            assert current["fingerprint"] == "etag:10"
+            acknowledged.extend(lease_ids)
+            service.stop_event.set()
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("backend.incremental.QueueClient", FakeQueue)
+    monkeypatch.setattr("backend.incremental.asyncio.sleep", no_sleep)
+    service.set_continuous(True)
+
+    await service.queue_loop()
+
+    assert acknowledged == ["lease-1"]
+    assert service.queue_last_ack_at is not None
 
 
 @pytest.mark.asyncio

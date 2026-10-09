@@ -51,7 +51,11 @@ from .scanner import (
     scan_object_with_retries,
 )
 from .storage import JobRecord, JobStorage, current_timestamp
-from .sync import create_sync_actions, create_sync_failure_result, execute_sync_action
+from .sync import (
+    create_sync_actions,
+    create_sync_failure_result,
+    execute_sync_action_async,
+)
 
 SESSION_COOKIE_NAME = "r2_clean_session"
 
@@ -113,6 +117,11 @@ def resolve_connection_settings(settings: AppSettings, profile: SourceConnection
         secret_access_key=secret_access_key,
         source_bucket=profile.source_bucket,
         credential_ref=profile.credential_ref,
+        transfer_adapter=settings.transfer_adapter,
+        rclone_binary_path=settings.rclone_binary_path,
+        rclone_transfer_timeout_seconds=settings.rclone_transfer_timeout_seconds,
+        rclone_output_limit_bytes=settings.rclone_output_limit_bytes,
+        rclone_low_level_retries=settings.rclone_low_level_retries,
     )
 
 
@@ -140,7 +149,9 @@ def get_connection_view(
             profile.endpoint.strip() and settings.credentials_ready_for(profile.credential_ref)
             for profile in profiles
         )
-        and settings.queue_credentials_ready,
+        and settings.queue_credentials_ready
+        and settings.transfer_adapter_ready
+        and settings.transfer_topology_ready(tuple(profile.endpoint for profile in profiles)),
         readiness_message=(
             settings.readiness_message_for(
                 credential_refs,
@@ -323,7 +334,7 @@ async def run_sync_job(application: FastAPI, sync_job_id: str, scan_job_id: str)
         for action in actions:
             try:
                 client = get_bucket_client(application, action.source_bucket)
-                result = await asyncio.to_thread(execute_sync_action, client, action)
+                result = await execute_sync_action_async(client, action)
             except Exception:
                 result = create_sync_failure_result(action)
             results.append(result)
@@ -374,7 +385,19 @@ async def application_lifespan(application: FastAPI):
     try:
         yield
     finally:
+        active_tasks = [
+            task
+            for task in (
+                cast(asyncio.Task[None] | None, application.state.active_scan_task),
+                cast(asyncio.Task[None] | None, application.state.active_sync_task),
+            )
+            if task is not None and not task.done()
+        ]
+        for task in active_tasks:
+            task.cancel()
         await incremental.stop()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
 
 
 def create_app(settings: AppSettings) -> FastAPI:
@@ -634,6 +657,18 @@ def create_app(settings: AppSettings) -> FastAPI:
         missing_mappings = find_missing_mappings(scan_report, mappings)
         if missing_mappings:
             return SyncPreflightResponse(success=False, reason="Some discovered models do not have target buckets")
+        if not settings.transfer_adapter_ready:
+            return SyncPreflightResponse(
+                success=False,
+                reason=settings.transfer_readiness_message,
+            )
+        if not settings.transfer_topology_ready(
+            tuple(profile.endpoint for profile in connection_profiles)
+        ):
+            return SyncPreflightResponse(
+                success=False,
+                reason="Rclone transfer requires Cloudflare R2 HTTPS endpoints",
+            )
         required_pairs = get_required_mapping_pairs(scan_report)
         target_sources: dict[str, set[str]] = {}
         for mapping in mappings:
